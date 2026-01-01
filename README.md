@@ -7,6 +7,8 @@
 
 By reinterpreting the residual block as a rank-1 Householder update, DDL unifies identity mapping, orthogonal projection, and geometric reflection into a single, continuously differentiable module. This allows the network to explicitly control the spectrum of its layer-wise transition operator, enabling the modeling of complex, non-monotonic dynamics while preserving the stable training characteristics of gated residual architectures.
 
+![](DDL.png)
+
 ## Abstract
 
 The efficacy of deep residual networks is fundamentally predicated on the identity shortcut connection. While this mechanism effectively mitigates the vanishing gradient problem, it imposes a strictly additive inductive bias on feature transformations, thereby limiting the network's capacity to model complex state transitions.
