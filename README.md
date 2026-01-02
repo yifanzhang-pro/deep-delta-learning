@@ -3,11 +3,16 @@
 [![Website](https://img.shields.io/badge/Project-Website-blue)](https://yifanzhang-pro.github.io/deep-delta-learning)
 [![License: CC-BY](https://img.shields.io/badge/License-CC_BY_4.0-yellow.svg)](https://creativecommons.org/licenses/by/4.0)
 
-**Deep Delta Learning (DDL)** represents a paradigm shift in residual network design. It generalizes the standard additive residual connection by modulating the identity shortcut with a learnable, data-dependent geometric transformation known as the **Delta Operator**.
+**Deep Delta Learning (DDL)** represents a paradigm shift in residual network design. It generalizes the standard additive residual connection by modulating the identity shortcut with a learnable, data-dependent geometric transformation known as the **Delta Operator**. 
+
+**Authors**: [Yifan Zhang](https://yifzhang.com), Yifeng Liu, Mengdi Wang, Quanquan Gu  
+**Affiliations**: Princeton University, UCLA  
+**Date**: January 1st, 2026
+
+![](DDL.png) 
 
 By reinterpreting the residual block as a rank-1 Householder update, DDL unifies identity mapping, orthogonal projection, and geometric reflection into a single, continuously differentiable module. This allows the network to explicitly control the spectrum of its layer-wise transition operator, enabling the modeling of complex, non-monotonic dynamics while preserving the stable training characteristics of gated residual architectures.
 
-![](DDL.png)
 
 ## Abstract
 
@@ -65,7 +70,7 @@ If you find this work useful in your research, please cite:
 ```bibtex
 @article{zhang2026deep,
    title   = {Deep Delta Learning},
-   author  = {Zhang, Yifan and et al.},
+   author  = {Zhang, Yifan and Liu, Yifeng and Wang, Mengdi and Gu, Quanquan},
    journal = {arXiv preprint arXiv:TBD},
    year    = {2026}
 }
