@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Deep Delta Learning</title>
+
+  <!-- Meta: SEO / Academic -->
+  <meta name="description" content="Deep Delta Learning (DDL) generalizes standard residual connections via a learnable, data-dependent geometric transformation, unifying identity mapping, projection, and reflection.">
+  <meta name="keywords" content="Deep Delta Learning, DDL, Residual Networks, Deep Learning, Geometric Algebra, Householder Reflection, Neural ODEs">
+  <meta name="citation_title" content="Deep Delta Learning">
+  <meta name="citation_author" content="Yifan Zhang">
+  <meta name="citation_author" content="Yifeng Liu">
+  <meta name="citation_author" content="Mengdi Wang">
+  <meta name="citation_author" content="Quanquan Gu">
+  <meta name="citation_publication_date" content="2026/01/01">
+  <meta property="og:title" content="Deep Delta Learning"/>
+  <meta property="og:description" content="Generalizing residual connections with learnable Householder reflections."/>
+  <meta property="og:type" content="website"/>
+  <link rel="icon" href="https://placehold.co/32x32/0A2540/FFFFFF?text=DDL" type="image/x-icon">
+
+  <!-- Fonts & CSS -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/bulma/0.9.4/css/bulma.min.css" />
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" />
+
+  <!-- MathJax -->
+  <script>
+    MathJax = {
+      tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']],
+        macros: { 
+          bm: ["\\mathbf{#1}", 1],
+          Xb: "\\mathbf{X}",
+          kb: "\\mathbf{k}",
+          vb: "\\mathbf{v}",
+          Ab: "\\mathbf{A}",
+          Ib: "\\mathbf{I}",
+          Fb: "\\mathcal{F}",
+          RR: "\\mathbb{R}"
+        }
+      },
+      svg: { fontCache: 'global' }
+    };
+  </script>
+  <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-svg.js"></script>
+
+  <!-- Theme -->
+  <style>
+    :root{
+      --primary-color:#0A2540;    /* Deep research navy */
+      --accent-color:#00C2FF;     /* Cyan accent */
+      --main-bg:#FFFFFF;
+      --content-bg:#F6F8FA;
+      --text-main:#2D2D2D;
+      --text-on-primary:#FFFFFF;
+      --link-color:var(--primary-color);
+      --link-hover-color:#143E73;
+      --primary-color-rgb:10,37,64;
+      --link-color-rgb:10,37,64;
+      --border-color:#e5e7eb;
+      --shadow-color:rgba(0,0,0,0.1);
+    }
+
+    html{scroll-behavior:smooth}
+    body{
+      font-family:'Inter',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;
+      color:var(--text-main); background:var(--main-bg);
+      display:flex; flex-direction:column; min-height:100vh;
+      text-rendering:optimizeLegibility; -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;
+    }
+
+    /* Navbar */
+    .navbar{
+      background:rgba(var(--primary-color-rgb),0.92);
+      backdrop-filter:blur(10px);
+      box-shadow:0 2px 5px var(--shadow-color);
+      position:sticky; top:0; z-index:100;
+    }
+    .navbar .navbar-item, .navbar .navbar-link{ color:var(--text-on-primary); font-weight:500; }
+    .navbar a.navbar-item:hover, .navbar .navbar-link:hover, .navbar-item.is-active{ color:var(--accent-color)!important; background:transparent!important; }
+    .navbar-burger{ color:var(--text-on-primary); }
+
+    /* Hero */
+    .hero{ background:linear-gradient(180deg, #0A2540 0%, #0e3055 100%); color:var(--text-on-primary); }
+    .hero .title{
+      font-family:'Space Grotesk', sans-serif; font-weight:700; color:var(--text-on-primary);
+      font-size:3.0rem; line-height:1.1;
+    }
+    .hero .subtitle.is-hero-subtitle{
+      color:rgba(255,255,255,0.92); font-size:1.18rem; max-width:980px; margin:1.25rem auto 2rem auto;
+    }
+    .hero .subtitle .highlight{ color:var(--accent-color); font-weight:600; }
+
+    .project-links a{ color:var(--text-on-primary); font-size:1.45rem; margin:0 0.6rem; transition:transform .25s ease, color .25s ease; }
+    .project-links a:hover{ color:var(--accent-color); transform:translateY(-2px); }
+
+    /* Sections */
+    .section.content-section{ padding:4.5rem 1.25rem; border-bottom:1px solid var(--border-color); }
+    .section.content-section:nth-child(even){ background:var(--content-bg); }
+    .section-title{
+      font-family:'Space Grotesk', sans-serif; font-weight:700; color:var(--primary-color);
+      margin-bottom:2.2rem;
+    }
+    .content{ max-width:1000px; margin:0 auto; line-height:1.8; font-size:1.06rem; }
+    .content a{ color:var(--link-color); font-weight:500; text-decoration:none; border-bottom:2px solid rgba(var(--link-color-rgb),.2); }
+    .content a:hover{ color:var(--link-hover-color); border-bottom-color:var(--link-hover-color); }
+    
+    /* Diagrams */
+    .diagram-container {
+        display: flex;
+        justify-content: center;
+        margin: 2rem 0;
+    }
+    .diagram-svg {
+        max-width: 100%;
+        height: auto;
+        box-shadow: 0 4px 15px rgba(0,0,0,0.05);
+        border-radius: 8px;
+        background: white;
+        padding: 1rem;
+    }
+
+    /* Code & Pre */
+    .content pre{
+      background:#0f172a; color:#cbd5e1; border-radius:8px; padding:1.1em 1.2em;
+      overflow:auto; box-shadow:inset 0 0 0 1px rgba(255,255,255,0.04);
+      font-size:0.95rem;
+    }
+    code{ background:#f2f4f7; color:#1f2937; padding:0.18em 0.38em; border-radius:4px; font-size:85%; }
+    pre code{ background:transparent; color:inherit; padding:0; font-size:inherit; }
+
+    /* Tables */
+    .table-container { overflow-x: auto; }
+    table.table { width: 100%; border-collapse: collapse; margin: 1.5rem 0; background-color: white; border-radius: 8px; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+    table.table th { background-color: #f8fafc; color: var(--primary-color); font-weight: 600; padding: 1rem; text-align: left; border-bottom: 2px solid #e2e8f0; }
+    table.table td { padding: 1rem; border-bottom: 1px solid #e2e8f0; color: var(--text-main); vertical-align: top; }
+    table.table tr:last-child td { border-bottom: none; }
+
+    /* Badges / pills */
+    .pill{ display:inline-block; padding:.35rem .6rem; border-radius:999px; font-size:.82rem; background:#E6F7FF; color:#0A2540; margin:.15rem .25rem; border:1px solid #C8ECFF; }
+
+    /* Footer */
+    .footer{
+      background:var(--primary-color); color:var(--text-on-primary);
+      padding:2rem 1.5rem; border-top:3px solid var(--accent-color); margin-top:auto;
+    }
+    .footer a{ color:var(--accent-color); font-weight:500; }
+    .footer a:hover{ color:#ffffff; }
+
+    /* Utility */
+    .mini-caption{ display:block; margin-top:.35rem; color:#6b7280; font-size: 0.9rem; text-align: center;}
+    .tight{ margin-top:0.5rem; margin-bottom:0.75rem; }
+  </style>
+
+  <!-- Structured data -->
+  <script type="application/ld+json">
+  {
+    "@context":"https://schema.org",
+    "@type":"ScholarlyArticle",
+    "name":"Deep Delta Learning",
+    "url":"https://yifanzhang-pro.github.io/deep-delta-learning/",
+    "datePublished":"2026-01-01",
+    "author":[{"@type":"Person","name":"Yifan Zhang"},{"@type":"Person","name":"Yifeng Liu"},{"@type":"Person","name":"Mengdi Wang"},{"@type":"Person","name":"Quanquan Gu"}],
+    "description":"Deep Delta Learning generalizes standard residual connections via a learnable, data-dependent geometric transformation."
+  }
+  </script>
+</head>
+<body>
+
+  <!-- NAVBAR -->
+  <nav class="navbar" role="navigation" aria-label="main navigation">
+    <div class="container">
+      <div class="navbar-brand">
+        <a class="navbar-item is-size-5 has-text-weight-bold" href="#">DDL</a>
+        <a role="button" class="navbar-burger" aria-label="menu" aria-expanded="false" data-target="navbarMenu">
+          <span aria-hidden="true"></span>
+          <span aria-hidden="true"></span>
+          <span aria-hidden="true"></span>
+        </a>
+      </div>
+      <div id="navbarMenu" class="navbar-menu">
+        <div class="navbar-end">
+          <a href="#abstract" class="navbar-item">Abstract</a>
+          <a href="#method" class="navbar-item">The Delta Block</a>
+          <a href="#analysis" class="navbar-item">Analysis</a>
+          <a href="#citation" class="navbar-item">Citation</a>
+          <a href="https://yifzhang.com" class="navbar-item">Yifan's Page</a>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+  <!-- HERO -->
+  <header class="hero is-medium">
+    <div class="hero-body">
+      <div class="container has-text-centered">
+        <h1 class="title">Deep Delta Learning</h1>
+        <h2 class="subtitle is-hero-subtitle">
+          A generalization of residual networks where a single scalar <span class="highlight">gate</span> dynamically interpolates between <span class="highlight">identity, projection, and reflection</span>, enabling the modeling of complex, non-monotonic dynamics.
+        </h2>
+        <h3 class="subtitle is-5" style="color:rgba(255,255,255,0.9); margin-top:1rem;">
+          <a href="https://yifzhang.com" target="_blank" rel="noopener" style="color:inherit; text-decoration:underline; text-underline-offset:2px;">Yifan Zhang</a><sup>1</sup>
+          &nbsp;&middot;&nbsp; Yifeng Liu<sup>2</sup> &nbsp;&middot;&nbsp; Mengdi Wang<sup>1</sup> &nbsp;&middot;&nbsp; Quanquan Gu<sup>2</sup>
+        </h3>
+        <h4 class="subtitle is-6" style="color:rgba(255,255,255,0.8); margin-top:-0.35rem;">
+          <sup>1</sup>Princeton University &nbsp;•&nbsp; <sup>2</sup>UCLA &nbsp;•&nbsp; January 1, 2026
+        </h4>
+        <div class="project-links" style="margin-top:1rem;">
+          <a href="#" target="_blank" rel="noopener" aria-label="Paper PDF"><i class="fas fa-file-pdf"></i></a>
+          <a href="#" aria-label="arXiv"><i class="fas fa-graduation-cap"></i></a>
+          <a href="https://github.com/yifanzhang-pro/deep-delta-learning" target="_blank" rel="noopener" aria-label="GitHub Repository"><i class="fab fa-github"></i></a>
+          <a href="#citation" aria-label="Citation"><i class="fas fa-quote-right"></i></a>
+        </div>
+        <div style="margin-top:1.25rem;">
+          <span class="pill">Residual Learning</span>
+          <span class="pill">Geometric Algebra</span>
+          <span class="pill">Householder Reflection</span>
+          <span class="pill">Neural ODEs</span>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <!-- ABSTRACT -->
+    <section id="abstract" class="section content-section">
+      <div class="container">
+        <h2 class="title is-3 has-text-centered section-title">Abstract</h2>
+        <div class="content has-text-justified" style="max-width:880px;">
+          <p>
+            The efficacy of deep residual networks is fundamentally predicated on the identity shortcut connection. While this mechanism effectively mitigates the vanishing gradient problem, it imposes a strictly additive inductive bias on feature transformations, thereby limiting the network's capacity to model complex state transitions.
+          </p>
+          <p>
+            In this paper, we introduce <strong>Deep Delta Learning (DDL)</strong>, a novel architecture that generalizes the standard residual connection by modulating the identity shortcut with a learnable, data-dependent geometric transformation. This transformation, termed the <strong>Delta Operator</strong>, constitutes a rank-1 perturbation of the identity matrix, parameterized by a reflection direction vector $\kb(\Xb)$ and a gating scalar $\beta(\Xb)$. We provide a spectral analysis of this operator, demonstrating that the gate $\beta(\Xb)$ enables dynamic interpolation between identity mapping, orthogonal projection, and geometric reflection. Furthermore, we restructure the residual update as a synchronous rank-1 injection, where the gate acts as a dynamic step size governing both the erasure of old information and the writing of new features. This unification empowers the network to explicitly control the spectrum of its layer-wise transition operator, enabling the modeling of complex, non-monotonic dynamics while preserving the stable training characteristics of gated residual architectures.
+          </p>
+          <p class="has-text-centered" style="margin-top:1.25rem;">
+            <a class="button is-link is-light" href="https://github.com/yifanzhang-pro/deep-delta-learning" target="_blank" rel="noopener">
+              <span class="icon"><i class="fab fa-github"></i></span><span>Project Repository</span>
+            </a>
+            <a class="button is-primary" style="background:var(--primary-color);" href="#" target="_blank" rel="noopener">
+              <span class="icon"><i class="fas fa-file-pdf"></i></span><span>Read the Paper</span>
+            </a>
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- METHOD / BLOCK DIAGRAM -->
+    <section id="method" class="section content-section">
+      <div class="container">
+        <h2 class="title is-3 has-text-centered section-title">The Delta Residual Block</h2>
+        <div class="content">
+          <p>
+            Standard residual networks approximate the ODE $\dot{\Xb} = \Fb(\Xb)$ via an additive update $\Xb_{l+1} = \Xb_l + \Fb(\Xb_l)$. DDL generalizes this by applying a rank-1 transformation to the hidden state matrix $\Xb \in \RR^{d \times d_v}$. The Delta-Res block update rule is defined as:
+          </p>
+
+          <p class="has-text-centered is-size-4 my-5">
+            $$
+            \Xb_{l+1} = \underbrace{(\Ib - \beta_l \kb_l \kb_l^\top)}_{\text{Delta Operator } \Ab(\Xb)} \Xb_l + \beta_l \kb_l \vb_l^\top
+            $$
+          </p>
+
+          <div class="diagram-container">
+            <!-- SVG Recreation of the TikZ Diagram -->
+            <svg class="diagram-svg" viewBox="0 0 500 280" width="600" height="340" xmlns="http://www.w3.org/2000/svg">
+              <defs>
+                <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                  <polygon points="0 0, 10 3.5, 0 7" fill="#8E8E93" />
+                </marker>
+              </defs>
+
+              <!-- Main Flow Line (Identity) -->
+              <path d="M 50 240 L 50 80 Q 50 40 90 40 L 410 40 L 410 60" fill="none" stroke="#8E8E93" stroke-width="2" marker-end="url(#arrowhead)" />
+              <text x="70" y="150" font-family="sans-serif" font-size="12" fill="#8E8E93" transform="rotate(-90 70 150)">Identity Path</text>
+
+              <!-- Input Node -->
+              <rect x="20" y="240" width="60" height="30" rx="4" fill="#E5E5EA" stroke="#8E8E93" />
+              <text x="50" y="260" text-anchor="middle" font-family="sans-serif" font-weight="bold" fill="#1C1C1E">$\Xb_l$</text>
+
+              <!-- Split Point -->
+              <circle cx="50" cy="220" r="3" fill="#8E8E93" />
+              
+              <!-- Parameter Gen (simulated) -->
+              <path d="M 50 220 L 150 220" fill="none" stroke="#8E8E93" stroke-width="2" stroke-dasharray="4" />
+
+              <!-- Parameters -->
+              <!-- K -->
+              <rect x="130" y="190" width="40" height="30" rx="4" fill="#EBF3FF" stroke="#8CB2FF" />
+              <text x="150" y="210" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#007AFF">$\kb$</text>
+              <text x="150" y="235" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#007AFF">Dir</text>
+
+              <!-- V -->
+              <rect x="180" y="190" width="40" height="30" rx="4" fill="#EEF9EF" stroke="#8FDEA2" />
+              <text x="200" y="210" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#34C759">$\vb$</text>
+              <text x="200" y="235" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#34C759">Val</text>
+
+              <!-- Beta -->
+              <rect x="230" y="190" width="40" height="30" rx="4" fill="#FFF7EB" stroke="#FFD086" />
+              <text x="250" y="210" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#FF9500">$\beta$</text>
+              <text x="250" y="235" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#FF9500">Gate</text>
+
+              <!-- Logic Spine (Vertical) -->
+              
+              <!-- Dot Product -->
+              <circle cx="150" cy="160" r="12" fill="white" stroke="#8E8E93" />
+              <text x="150" y="164" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#8E8E93">•</text>
+              <text x="170" y="164" font-family="sans-serif" font-size="10" fill="#8E8E93">Proj</text>
+              
+              <!-- Subtract -->
+              <circle cx="150" cy="120" r="12" fill="white" stroke="#8E8E93" />
+              <text x="150" y="124" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#8E8E93">−</text>
+
+              <!-- Gate Mult -->
+              <circle cx="150" cy="80" r="12" fill="white" stroke="#8E8E93" />
+              <text x="150" y="84" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#8E8E93">×</text>
+
+              <!-- Direction Mult -->
+              <circle cx="150" cy="40" r="12" fill="white" stroke="#8E8E93" />
+              <text x="150" y="44" text-anchor="middle" font-family="sans-serif" font-size="12" fill="#8E8E93">×</text>
+
+              <!-- Add to Residual -->
+              <circle cx="410" cy="80" r="14" fill="white" stroke="#8E8E93" />
+              <text x="410" y="85" text-anchor="middle" font-family="sans-serif" font-size="14" fill="#8E8E93">+</text>
+
+              <!-- Output -->
+              <rect x="380" y="120" width="60" height="30" rx="4" fill="#E5E5EA" stroke="#8E8E93" />
+              <text x="410" y="140" text-anchor="middle" font-family="sans-serif" font-weight="bold" fill="#1C1C1E">$\Xb_{l+1}$</text>
+              
+              <!-- Connections -->
+              <!-- k to dot -->
+              <path d="M 150 190 L 150 172" fill="none" stroke="#8E8E93" stroke-width="1.5" marker-end="url(#arrowhead)" />
+              <!-- X to dot (ghost line) -->
+              <path d="M 80 240 L 120 240 L 120 160 L 138 160" fill="none" stroke="#8E8E93" stroke-width="1.5" stroke-dasharray="2" marker-end="url(#arrowhead)" />
+              
+              <!-- dot to sub -->
+              <path d="M 150 148 L 150 132" fill="none" stroke="#8E8E93" stroke-width="1.5" marker-end="url(#arrowhead)" />
+              <!-- v to sub -->
+              <path d="M 200 190 L 200 120 L 162 120" fill="none" stroke="#8E8E93" stroke-width="1.5" marker-end="url(#arrowhead)" />
+              
+              <!-- sub to beta_mult -->
+              <path d="M 150 108 L 150 92" fill="none" stroke="#8E8E93" stroke-width="1.5" marker-end="url(#arrowhead)" />
+              <!-- beta to beta_mult -->
+              <path d="M 250 190 L 250 80 L 162 80" fill="none" stroke="#8E8E93" stroke-width="1.5" marker-end="url(#arrowhead)" />
+
+              <!-- beta_mult to k_mult -->
+              <path d="M 150 68 L 150 52" fill="none" stroke="#8E8E93" stroke-width="1.5" marker-end="url(#arrowhead)" />
+              <!-- k to k_mult (loop around) -->
+              <path d="M 130 205 L 110 205 L 110 40 L 138 40" fill="none" stroke="#8E8E93" stroke-width="1.5" marker-end="url(#arrowhead)" />
+
+              <!-- k_mult to Add -->
+              <path d="M 162 40 L 410 40 L 410 66" fill="none" stroke="#8E8E93" stroke-width="1.5" marker-end="url(#arrowhead)" />
+              
+              <!-- Add to Output -->
+              <path d="M 410 94 L 410 120" fill="none" stroke="#8E8E93" stroke-width="1.5" marker-end="url(#arrowhead)" />
+
+            </svg>
+          </div>
+          <span class="mini-caption"><strong>Figure 1: The Deep Delta Residual Block.</strong> The architecture generalizes the standard residual connection. A learnable scalar gate $\beta$ controls a rank-1 geometric transformation.</span>
+
+          <p>
+             The network learns the reflection direction $\kb \in \RR^d$, the value vector $\vb \in \RR^{d_v}$, and the gate $\beta \in \RR$. This formulation couples the "erasure" of old information (via projection onto $\kb$) with the "writing" of new information (via injection of $\vb$), scaled synchronously by the gate $\beta$.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ANALYSIS -->
+    <section id="analysis" class="section content-section">
+      <div class="container">
+        <h2 class="title is-3 has-text-centered section-title">Spectral Analysis & Geometric Unification</h2>
+        <div class="content">
+          <p>
+            The expressive power of DDL stems from the spectral properties of the Delta Operator $\Ab(\Xb)$, which are deterministically controlled by the gate $\beta$. 
+            The eigenvalues of $\Ab(\Xb)$ are $\{1, \dots, 1, 1-\beta\}$. This allows the network to interpolate between three fundamental linear transformations:
+          </p>
+
+          <div class="table-container">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>Regime</th>
+                  <th>$\beta$ Value</th>
+                  <th>Spectrum</th>
+                  <th>Interpretation</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Identity</strong></td>
+                  <td>$\beta \to 0$</td>
+                  <td>$\{1\}$</td>
+                  <td><strong>Skip Connection</strong>: Signal preservation for deep propagation. $\Xb_{l+1} \approx \Xb_l$.</td>
+                </tr>
+                <tr>
+                  <td><strong>Projection</strong></td>
+                  <td>$\beta \to 1$</td>
+                  <td>$\{0, 1\}$</td>
+                  <td><strong>Forgetting</strong>: Orthogonal projection onto the hyperplane $\kb^\perp$, erasing components parallel to $\kb$. $\det(\Ab) \to 0$.</td>
+                </tr>
+                <tr>
+                  <td><strong>Reflection</strong></td>
+                  <td>$\beta \to 2$</td>
+                  <td>$\{-1, 1\}$</td>
+                  <td><strong>Householder Reflection</strong>: Inverts the state along $\kb$, introducing negative eigenvalues to model oscillatory/oppositional dynamics. $\det(\Ab) \to -1$.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <h3 class="title is-4">Depth-Wise Delta Rule</h3>
+          <p>
+            DDL establishes a theoretical link to efficient sequence models like <strong>DeltaNet</strong>. While DeltaNet applies the "Delta Rule" over the time dimension, Deep Delta Learning applies it over the <strong>depth dimension</strong>. Expanding the DDL update reveals the classic Delta Rule structure:
+          </p>
+
+          <p class="has-text-centered is-size-5 my-4">
+             $$
+             \Xb_{l+1} = \Xb_l + \beta_l \kb_l (\underbrace{\vb_l^\top}_{\text{Target}} - \underbrace{\kb_l^\top \Xb_l}_{\text{Current Projection}})
+             $$
+          </p>
+
+          <p>
+            This allows the network to selectively "clean" or "rewrite" specific feature subspaces layer-by-layer, preventing the accumulation of interference common in standard additive ResNets.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- CITATION -->
+    <section id="citation" class="section content-section">
+      <div class="container">
+        <h2 class="title is-3 has-text-centered section-title">Citation</h2>
+        <div class="content">
+          <p>If you find this work useful, please cite:</p>
+          <pre id="cite-bibtex"><code>@article{zhang2026deep,
+   title   = {Deep Delta Learning},
+   author  = {Zhang, Yifan and Liu, Yifeng and Wang, Mengdi and Gu, Quanquan},
+   journal = {arXiv preprint arXiv:TBD},
+   year    = {2026}
+}</code></pre>
+          <p>
+            <button id="copy-cite" class="button is-small is-link is-light">
+              <span class="icon"><i class="fas fa-clipboard"></i></span>
+              <span>Copy BibTeX</span>
+            </button>
+          </p>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- FOOTER -->
+  <footer class="footer">
+    <div class="container">
+      <div class="content has-text-centered">
+        <p>
+          <a href="#abstract">Abstract</a> &nbsp;&bull;&nbsp;
+          <a href="#method">The Delta Block</a> &nbsp;&bull;&nbsp;
+          <a href="#analysis">Analysis</a> &nbsp;&bull;&nbsp;
+          <a href="#citation">Citation</a>
+        </p>
+        <p>&copy; 2026 Yifan Zhang. All rights reserved.</p>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    // Mobile navbar toggle
+    document.addEventListener('DOMContentLoaded', () => {
+      const $burgers = Array.from(document.querySelectorAll('.navbar-burger'));
+      $burgers.forEach(el => {
+        el.addEventListener('click', () => {
+          const target = el.dataset.target;
+          const $target = document.getElementById(target);
+          el.classList.toggle('is-active');
+          $target.classList.toggle('is-active');
+        });
+      });
+
+      // Hex → rgb helper and CSS var initialization
+      function hexToRgb(hex){
+        const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(hex);
+        return m ? { r:parseInt(m[1],16), g:parseInt(m[2],16), b:parseInt(m[3],16) } : null;
+      }
+      const root = document.documentElement;
+      const styles = getComputedStyle(root);
+      const p = styles.getPropertyValue('--primary-color').trim();
+      const l = styles.getPropertyValue('--link-color').trim();
+      const prgb = hexToRgb(p), lrgb = hexToRgb(l);
+      if(prgb){ root.style.setProperty('--primary-color-rgb', `${prgb.r}, ${prgb.g}, ${prgb.b}`); }
+      if(lrgb){ root.style.setProperty('--link-color-rgb', `${lrgb.r}, ${lrgb.g}, ${lrgb.b}`); }
+
+      // Copy BibTeX
+      const btn = document.getElementById('copy-cite');
+      const pre = document.getElementById('cite-bibtex');
+      if(btn && pre){
+        btn.addEventListener('click', async () => {
+          const text = pre.innerText;
+          try{
+            await navigator.clipboard.writeText(text);
+            btn.classList.add('is-success');
+            btn.classList.remove('is-link','is-light');
+            btn.innerHTML = '<span class="icon"><i class="fas fa-check"></i></span><span>Copied</span>';
+            setTimeout(() => {
+              btn.classList.remove('is-success');
+              btn.classList.add('is-link','is-light');
+              btn.innerHTML = '<span class="icon"><i class="fas fa-clipboard"></i></span><span>Copy BibTeX</span>';
+            }, 1600);
+          }catch(e){
+            // Fallback select
+            const range = document.createRange();
+            range.selectNode(pre);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+            try{ document.execCommand('copy'); }catch(_){}
+            sel.removeAllRanges();
+          }
+        });
+      }
+    });
+  </script>
+
+</body>
+</html>
