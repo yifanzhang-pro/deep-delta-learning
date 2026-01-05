@@ -1,7 +1,8 @@
 # Deep Delta Learning
 
+[![arXiv](https://img.shields.io/badge/arXiv-2601.00417-b31b1b.svg)](https://arxiv.org/abs/2601.00417)
 [![Website](https://img.shields.io/badge/Project-Website-blue)](https://yifanzhang-pro.github.io/deep-delta-learning)
-[![License: CC-BY](https://img.shields.io/badge/License-CC_BY_4.0-yellow.svg)](https://creativecommons.org/licenses/by/4.0)
+[![License: CC-BY](https://img.shields.io/badge/License-CC_BY_4.0-yellow.svg)](https://creativecommons.org/licenses/by/4.0) 
 
 ### Deep Delta Learning and Matrix Hidden States 
 
