@@ -11,6 +11,8 @@
 **Affiliations**: Princeton University, UCLA  
 **Date**: January 1st, 2026
 
+[[Webpage](https://yifanzhang-pro.github.io/deep-delta-learning)] [[Huggingface](https://huggingface.co/papers/2601.00417)] 
+
 ![](DDL.png) 
 
 By reinterpreting the residual block as a rank-1 Householder update, DDL unifies identity mapping, orthogonal projection, and geometric reflection into a single, continuously differentiable module. This allows the network to explicitly control the spectrum of its layer-wise transition operator, enabling the modeling of complex, non-monotonic dynamics while preserving the stable training characteristics of gated residual architectures.
