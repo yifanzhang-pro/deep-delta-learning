@@ -76,7 +76,7 @@ If you find this work useful in your research, please cite:
 @article{zhang2026deep,
    title   = {Deep Delta Learning},
    author  = {Zhang, Yifan and Liu, Yifeng and Wang, Mengdi and Gu, Quanquan},
-   journal = {arXiv preprint arXiv:TBD},
+   journal = {arXiv preprint arXiv:2601.00417},
    year    = {2026}
 }
 ```
