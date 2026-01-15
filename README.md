@@ -68,6 +68,10 @@ $$
 
 This allows the network to selectively "clean" or "rewrite" specific feature subspaces layer-by-layer, preventing the accumulation of interference common in standard additive ResNets.
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=yifanzhang-pro/deep-delta-learning&type=Date)](https://star-history.com/#yifanzhang-pro/deep-delta-learning&Date)
+
 ## Citation
 
 If you find this work useful in your research, please cite:
