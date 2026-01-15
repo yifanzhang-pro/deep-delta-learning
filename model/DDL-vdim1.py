@@ -132,6 +132,7 @@ class DeepDeltaResidualVdim1(nn.Module):
 
         self.k_eps = float(getattr(config, "ddl_k_eps", 1e-6))
         self.v_sigmoid = bool(getattr(config, "ddl_v_sigmoid", True))
+        self.v_sigmoid_scale: float = float(getattr(config, "ddl_v_sigmoid_scale", 4.0))
         self.v_constant = bool(getattr(config, "ddl_v_dim1_constant", False))
         self.v_constant_value: float = float(getattr(config, "ddl_v_dim1_constant_value", 2.0))
 
@@ -179,7 +180,7 @@ class DeepDeltaResidualVdim1(nn.Module):
             # v(X) is scalar for d_v=1.
             v = self.v_proj(x)
             if self.v_sigmoid:
-                v = torch.sigmoid(v)
+                v = torch.sigmoid(v) * self.v_sigmoid_scale
 
         # x <- x + beta * k * (v - k^T x)
         delta = (beta * (v - proj)).to(dtype=x.dtype)  # (B, T, 1)
@@ -239,8 +240,9 @@ class GPTConfig(PretrainedConfig):
     ddl_k_eps: float = 1e-6
     ddl_beta_hidden_size: int = 128
     ddl_beta_single_linear: bool = True
-    ddl_v_sigmoid: bool = False
-    ddl_v_dim1_constant: bool = True
+    ddl_v_sigmoid: bool = True
+    ddl_v_sigmoid_scale: float = 4.0
+    ddl_v_dim1_constant: bool = False
     ddl_v_dim1_constant_value: float = 2.0
     # Initialize beta; clamped to [0, 2]. Use 1.0 by default for baseline comparability.
     ddl_beta_init: float = 1.0
@@ -251,7 +253,7 @@ class GPTConfig(PretrainedConfig):
 
 class GPT(PreTrainedModel):
     config_class = GPTConfig
-    base_model_prefix = "nanogpt"
+    base_model_prefix = "nanogpt-pro"
     supports_gradient_checkpointing = True
 
     def __init__(self, config):
