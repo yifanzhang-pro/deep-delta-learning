@@ -17,6 +17,7 @@ from typing import Any
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_utils import PreTrainedModel
 
+from .gpt_base import PastKeyValue
 from .rmsnorm import RMSNorm
 from .kv_shift import ShiftLinear
 from .init_utils import init_gpt_weights
@@ -66,8 +67,19 @@ class CausalSelfAttention(nn.Module):
             # Apply RMSNorm to each head's output dimension
             self.subln = RMSNorm(self.head_dim, eps=1e-5, elementwise_affine=True)
 
-    def forward(self, x):
-        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (hidden_size)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y, _ = self.forward_with_past(x)
+        return y
+
+    def forward_with_past(
+        self,
+        x: torch.Tensor,
+        *,
+        past_key_value: PastKeyValue | None = None,
+        use_cache: bool = False,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, PastKeyValue | None]:
+        B, T, _ = x.size()  # batch size, sequence length, embedding dimensionality (hidden_size)
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         if self.use_k_shift:
             k = self.c_k(x, None).view(B, T, self.n_head, self.head_dim)
@@ -77,13 +89,58 @@ class CausalSelfAttention(nn.Module):
             v = self.c_v(x, None).view(B, T, self.n_head, self.head_dim)
         else:
             v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
-        cos, sin = self.rotary(q)
+        past_len = 0
+        past_k: torch.Tensor | None = None
+        past_v: torch.Tensor | None = None
+        if past_key_value is not None:
+            if len(past_key_value) < 2:
+                raise ValueError("past_key_value must have at least 2 tensors: (key, value).")
+            past_k = past_key_value[0]
+            past_v = past_key_value[1]
+            past_len = int(past_k.shape[-2])
+
+        cos, sin = self.rotary(q, seq_len_offset=past_len)
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
         # Apply learnable RMSNorm to Q and K if enabled
         if self.use_qk_rmsnorm:
             q = self.q_rms(q)
             k = self.k_rms(k)
-        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+
+        q_t = q.transpose(1, 2)
+        k_t = k.transpose(1, 2)
+        v_t = v.transpose(1, 2)
+
+        if past_k is not None and past_v is not None:
+            k_t = torch.cat([past_k, k_t], dim=-2)
+            v_t = torch.cat([past_v, v_t], dim=-2)
+
+        total_len = int(k_t.shape[-2])
+        attn_mask: torch.Tensor | None = None
+        if attention_mask is not None:
+            if attention_mask.ndim != 2:
+                raise ValueError(f"attention_mask must have shape (B, S), got {tuple(attention_mask.shape)}")
+            if int(attention_mask.shape[0]) != B:
+                raise ValueError(f"attention_mask batch mismatch: expected {B}, got {int(attention_mask.shape[0])}")
+            if int(attention_mask.shape[1]) != total_len:
+                raise ValueError(
+                    f"attention_mask sequence mismatch: expected {total_len}, got {int(attention_mask.shape[1])}"
+                )
+            attn_mask = attention_mask.to(dtype=torch.bool)[:, None, None, :]
+
+        use_is_causal = past_len == 0 and attn_mask is None
+        if not use_is_causal:
+            if T > 1:
+                key_positions = torch.arange(total_len, device=x.device)
+                query_positions = past_len + torch.arange(T, device=x.device)
+                causal_mask = key_positions <= query_positions[:, None]
+            else:
+                causal_mask = torch.ones((T, total_len), dtype=torch.bool, device=x.device)
+            if attn_mask is not None:
+                attn_mask = attn_mask & causal_mask[None, None, :, :]
+            else:
+                attn_mask = causal_mask[None, None, :, :]
+
+        y = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_mask, is_causal=use_is_causal)
 
         if self.using_groupnorm:
             # Apply RMSNorm directly to each head's output
@@ -91,7 +148,10 @@ class CausalSelfAttention(nn.Module):
 
         y = y.transpose(1, 2).contiguous().reshape(B, T, self.n_head * self.head_dim)
         y = self.c_proj(y)
-        return y
+        present: PastKeyValue | None = None
+        if use_cache:
+            present = (k_t, v_t)
+        return y, present
 
 
 class MLP(nn.Module):
@@ -162,7 +222,10 @@ class DeepDeltaResidualVdim1(nn.Module):
     def forward(self, x: torch.Tensor, *, k_in: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         # x: (B, T, C), k_in: (B, T, C), context: (B, T, C)
         # Keep large tensors in the model dtype; only compute `beta` in fp32 for stability.
-        k = F.normalize(k_in, p=2, dim=-1, eps=self.k_eps)
+        k_dim = int(k_in.size(-1))
+        eps_rms = (self.k_eps * self.k_eps) / float(k_dim)
+        k_rms = F.rms_norm(k_in, [k_dim], eps=eps_rms)
+        k_scale = 1.0 / math.sqrt(k_dim)
 
         # beta(X) in [0, 2]
         if self.beta_single_linear:
@@ -172,7 +235,8 @@ class DeepDeltaResidualVdim1(nn.Module):
         beta = 2.0 * torch.sigmoid(beta_logits)  # fp32
 
         # k^T x, scalar projection (B, T, 1)
-        proj = torch.sum(k * x, dim=-1, keepdim=True, dtype=torch.float32)  # fp32
+        proj_rms = torch.sum(k_rms * x, dim=-1, keepdim=True, dtype=torch.float32)  # fp32
+        proj = proj_rms * k_scale
 
         if self.v_constant:
             v = torch.full_like(proj, self.v_constant_value)
@@ -183,8 +247,8 @@ class DeepDeltaResidualVdim1(nn.Module):
                 v = torch.sigmoid(v) * self.v_sigmoid_scale
 
         # x <- x + beta * k * (v - k^T x)
-        delta = (beta * (v - proj)).to(dtype=x.dtype)  # (B, T, 1)
-        update = delta * k
+        delta_scaled = ((beta * (v - proj)) * k_scale).to(dtype=x.dtype)  # (B, T, 1)
+        update = delta_scaled * k_rms
         return x + update
 
 
@@ -217,7 +281,7 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig(PretrainedConfig):
-    model_type = "nanogpt"
+    model_type = "nanogpt-pro"
     vocab_size: int = 50304
     num_hidden_layers: int = 12
     num_attention_heads: int = 6  # head dim 128 suggested by @Grad62304977
@@ -314,15 +378,17 @@ class GPT(PreTrainedModel):
         return logits, loss
 
     def crop_block_size(self, block_size):
-        # model surgery to decrease the block size if necessary
-        # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
-        # but want to use a smaller block size for some smaller, simpler model
-        # assert block_size <= self.config.block_size
-        # self.config.block_size = block_size
-        # self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
-        # for block in self.transformer.h:
-        #     block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
-        pass
+        block_size_int = int(block_size)
+        if block_size_int <= 0:
+            raise ValueError(f"block_size must be a positive integer, got {block_size_int}.")
+
+        current = getattr(self.config, "block_size", None)
+        if isinstance(current, int):
+            current_int = int(current)
+            if block_size_int > current_int:
+                raise ValueError(f"block_size must be <= {current_int} to crop, got {block_size_int}.")
+
+        setattr(self.config, "block_size", block_size_int)
 
     def estimate_mfu(self, fwdbwd_per_iter, dt):
         """estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS"""
