@@ -8,7 +8,7 @@
 
 **Deep Delta Learning (DDL)** represents a paradigm shift in residual network design. It generalizes the standard additive residual connection by modulating the identity shortcut with a learnable, data-dependent geometric transformation known as the **Delta Operator**. 
 
-**Authors**: [Yifan Zhang](https://yifzhang.com), Yifeng Liu, Mengdi Wang, Quanquan Gu  
+**Authors**: [Yifan Zhang](https://YFZ.ai), Yifeng Liu, Mengdi Wang, Quanquan Gu  
 **Affiliations**: Princeton University, UCLA  
 **Date**: January 1st, 2026
 
