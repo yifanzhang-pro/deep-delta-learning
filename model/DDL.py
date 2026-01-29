@@ -22,10 +22,12 @@ import math
 from dataclasses import dataclass
 from typing import Any
 from transformers.configuration_utils import PretrainedConfig
+from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 
 from .activations import ActivationName, apply_activation, validate_activation_name
 from .gpt_base import PastKeyValue
+from .kv_cache import append_preallocated, get_past_len, maybe_get_cache_len
 from .rmsnorm import RMSNorm
 from .kv_shift import ShiftLinear
 from .init_utils import init_gpt_weights
@@ -84,6 +86,11 @@ class CausalSelfAttention(nn.Module):
             if not self.using_groupnorm:
                 self.o_norm = RMSNorm(self.head_dim, eps=getattr(config, "rms_norm_eps", 1e-5), elementwise_affine=True)
 
+        kv_cache_slot_size = int(getattr(config, "kv_cache_slot_size", 128))
+        if kv_cache_slot_size <= 0:
+            raise ValueError(f"kv_cache_slot_size must be positive, got {kv_cache_slot_size}.")
+        self.kv_cache_slot_size = kv_cache_slot_size
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y, _ = self.forward_with_past(x)
         return y
@@ -113,12 +120,21 @@ class CausalSelfAttention(nn.Module):
         past_len = 0
         past_k: torch.Tensor | None = None
         past_v: torch.Tensor | None = None
+        cache_len = maybe_get_cache_len(past_key_value, batch_size=B)
+        past_k_used: torch.Tensor | None = None
+        past_v_used: torch.Tensor | None = None
         if past_key_value is not None:
             if len(past_key_value) < 2:
                 raise ValueError("past_key_value must have at least 2 tensors: (key, value).")
             past_k = past_key_value[0]
             past_v = past_key_value[1]
-            past_len = int(past_k.shape[-2])
+            past_len = get_past_len(past_k=past_k, cache_len=cache_len)
+            if cache_len is None:
+                past_k_used = past_k
+                past_v_used = past_v
+            else:
+                past_k_used = past_k[:, :, :past_len, :]
+                past_v_used = past_v[:, :, :past_len, :]
 
         cos, sin = self.rotary(q, seq_len_offset=past_len)
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
@@ -131,9 +147,21 @@ class CausalSelfAttention(nn.Module):
         k_t = k.transpose(1, 2)
         v_t = v.transpose(1, 2)
 
-        if past_k is not None and past_v is not None:
-            k_t = torch.cat([past_k, k_t], dim=-2)
-            v_t = torch.cat([past_v, v_t], dim=-2)
+        cache_tensors: list[torch.Tensor] | None = None
+        cache_len_out: torch.Tensor | None = None
+        if use_cache:
+            views, caches, cache_len_out = append_preallocated(
+                past=[past_k, past_v] if past_k is not None and past_v is not None else None,
+                cache_len=cache_len,
+                past_len=past_len,
+                new=[k_t, v_t],
+                slot_size=self.kv_cache_slot_size,
+            )
+            k_t, v_t = views
+            cache_tensors = caches
+        elif past_k_used is not None and past_v_used is not None:
+            k_t = torch.cat([past_k_used, k_t], dim=-2)
+            v_t = torch.cat([past_v_used, v_t], dim=-2)
 
         total_len = int(k_t.shape[-2])
         attn_mask: torch.Tensor | None = None
@@ -177,7 +205,9 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         present: PastKeyValue | None = None
         if use_cache:
-            present = (k_t, v_t)
+            if cache_tensors is None or cache_len_out is None:
+                raise RuntimeError("KV cache append did not return expected cache tensors.")
+            present = (cache_tensors[0], cache_tensors[1], cache_len_out)
         return y, present
 
 
@@ -242,6 +272,48 @@ class ResidualShortConvCompressor(nn.Module):
         x_flat = x.reshape(B, T, self.residual_size)
         x_conv = self.shortconv(x_flat).reshape(B, T, d, dv)
         return torch.sum(x_conv * self.read, dim=-1)
+
+    def forward_with_past(
+        self, x: torch.Tensor, *, past: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # past: (B, C, k-1) where C = hidden_size * value_channels
+        B, T, d, dv = x.shape
+        if d != self.hidden_size:
+            raise ValueError(f"Expected residual d={self.hidden_size}, got {d}.")
+        if dv != self.value_channels:
+            raise ValueError(f"Expected residual d_v={self.value_channels}, got {dv}.")
+
+        kernel_size = int(getattr(self.shortconv, "kernel_size", 0))
+        if kernel_size <= 1:
+            return self.forward(x), None
+
+        if bool(getattr(self.shortconv, "shift_right1", False)):
+            raise NotImplementedError("shift_right1 shortconv is not supported in DDL kv-cache mode.")
+
+        x_flat = x.reshape(B, T, self.residual_size)
+        x_t = x_flat.transpose(1, 2).contiguous()  # (B, C, T)
+        past_len = kernel_size - 1
+
+        if past is None:
+            past = torch.zeros((B, self.residual_size, past_len), device=x.device, dtype=x.dtype)
+        if (
+            past.ndim != 3
+            or int(past.shape[0]) != B
+            or int(past.shape[1]) != self.residual_size
+            or int(past.shape[2]) != past_len
+        ):
+            raise ValueError(f"Expected past with shape (B, C, {past_len}), got {tuple(past.shape)}")
+
+        x_cat = torch.cat([past.to(device=x.device, dtype=x.dtype), x_t], dim=-1)  # (B, C, past_len+T)
+        weight = self.shortconv.conv.weight
+        y = F.conv1d(x_cat, weight, bias=None, stride=1, padding=0, groups=self.residual_size)  # (B, C, T)
+
+        y_bt = y.transpose(1, 2).contiguous()  # (B, T, C)
+        y_bt = apply_activation(y_bt, getattr(self.shortconv, "activation", None))
+        y = y_bt.reshape(B, T, d, dv)
+        out = torch.sum(y * self.read, dim=-1)
+        past_out = x_cat[:, :, -past_len:].contiguous()
+        return out, past_out
 
 
 class DeepDeltaResidualExpanded(nn.Module):
@@ -353,6 +425,42 @@ class Block(nn.Module):
         x = self.ddl_mlp(x, k_in=k_mlp, v_in=x_in, context=x_norm)
         return x
 
+    def forward_with_past(
+        self,
+        x: torch.Tensor,
+        *,
+        past_key_value: PastKeyValue | None = None,
+        use_cache: bool = False,
+        attention_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, PastKeyValue | None]:
+        conv_pre_attn: torch.Tensor | None = None
+        conv_pre_mlp: torch.Tensor | None = None
+        if past_key_value is not None and len(past_key_value) >= 5:
+            conv_pre_attn = past_key_value[2]
+            conv_pre_mlp = past_key_value[3]
+
+        x_in, conv_pre_attn_out = self.compress.forward_with_past(x, past=conv_pre_attn)
+        x_norm = self.ln_1(x_in)
+        k_attn, present_attn = self.attn.forward_with_past(
+            x_norm, past_key_value=past_key_value, use_cache=use_cache, attention_mask=attention_mask
+        )
+        x = self.ddl_attn(x, k_in=k_attn, v_in=x_in, context=x_norm)
+
+        x_in, conv_pre_mlp_out = self.compress.forward_with_past(x, past=conv_pre_mlp)
+        x_norm = self.ln_2(x_in)
+        k_mlp = self.mlp(x_norm)
+        x = self.ddl_mlp(x, k_in=k_mlp, v_in=x_in, context=x_norm)
+
+        present: PastKeyValue | None = None
+        if use_cache:
+            if present_attn is None:
+                raise RuntimeError("Attention did not return present_key_value for KV cache.")
+            if conv_pre_attn_out is not None and conv_pre_mlp_out is not None:
+                present = (present_attn[0], present_attn[1], conv_pre_attn_out, conv_pre_mlp_out, present_attn[-1])
+            else:
+                present = present_attn
+        return x, present
+
 
 # -----------------------------------------------------------------------------
 # The main GPT-2 model
@@ -427,20 +535,94 @@ class GPT(PreTrainedModel):
         self.readout = ResidualShortConvCompressor(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         # weight tying between token embedding and LM head
-        self.transformer.wte.weight = self.lm_head.weight  # https://paperswithcode.com/method/weight-tying
+        self.tie_weights()  # https://paperswithcode.com/method/weight-tying
         # Final RMSNorm defined in the network
         self.ln_f = RMSNorm(config.hidden_size)
         init_gpt_weights(self, config)
 
-    def forward(self, idx, targets=None, return_logits=True, output_all_seq=False):
-        # forward the GPT model itself
-        x_emb = self.transformer.wte(idx)  # token embeddings of shape (b, t, d)
+    def tie_weights(self) -> None:
+        self.lm_head.weight = self.transformer.wte.weight
+
+    def forward(
+        self,
+        idx: torch.Tensor | None = None,
+        targets: torch.Tensor | None = None,
+        return_logits: bool = True,
+        output_all_seq: bool = False,
+        *,
+        input_ids: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
+        past_key_values: tuple[PastKeyValue, ...] | None = None,
+        use_cache: bool | None = None,
+        output_hidden_states: bool | None = None,
+        output_attentions: bool | None = None,
+        return_dict: bool | None = None,
+        cache_position: torch.Tensor | None = None,
+        **kwargs: Any,
+    ) -> CausalLMOutputWithPast | tuple[torch.Tensor | None, torch.Tensor | None]:
+        del position_ids, cache_position, kwargs
+
+        if (idx is None) == (input_ids is None):
+            raise ValueError("Exactly one of `idx` or `input_ids` must be provided.")
+        if idx is None:
+            idx = input_ids
+
+        if labels is not None and targets is not None:
+            raise ValueError("Only one of `labels` or `targets` can be provided.")
+        if targets is None:
+            targets = labels
+
+        use_cache_flag = bool(use_cache) if use_cache is not None else False
+        return_dict_flag = bool(return_dict) if return_dict is not None else False
+        output_hidden_states_flag = bool(output_hidden_states) if output_hidden_states is not None else False
+        output_attentions_flag = bool(output_attentions) if output_attentions is not None else False
+
+        if output_attentions_flag:
+            raise NotImplementedError("output_attentions=True is not currently supported for DDL models.")
+
+        if attention_mask is not None and bool(attention_mask.to(dtype=torch.bool).all().item()):
+            attention_mask = None
+
+        readout_state: torch.Tensor | None = None
+        if past_key_values is not None:
+            past0 = past_key_values[0]
+            if len(past0) >= 6:
+                readout_state = past0[4]
+
+        x_emb = self.transformer.wte(idx)  # (B, T, d)
         value_channels = int(getattr(self.config, "ddl_value_channels", 4))
-        x = x_emb.unsqueeze(-1).repeat(1, 1, 1, value_channels)  # (b, t, d, d_v)
-        for block in self.transformer.h:
-            x = block(x)
-        # Apply final RMSNorm before the LM head
-        x_out = self.readout(x)
+        x = x_emb.unsqueeze(-1).repeat(1, 1, 1, value_channels)  # (B, T, d, d_v)
+        hidden_states: tuple[torch.Tensor, ...] | None = (x_emb,) if output_hidden_states_flag else None
+
+        present_key_values: list[PastKeyValue] | None = [] if use_cache_flag else None
+        if past_key_values is not None and len(past_key_values) != len(self.transformer.h):
+            raise ValueError(f"past_key_values must have length {len(self.transformer.h)}, got {len(past_key_values)}.")
+
+        for layer_idx, block in enumerate(self.transformer.h):
+            if use_cache_flag or past_key_values is not None or attention_mask is not None:
+                past = past_key_values[layer_idx] if past_key_values is not None else None
+                x, present = block.forward_with_past(
+                    x,
+                    past_key_value=past,
+                    use_cache=use_cache_flag,
+                    attention_mask=attention_mask,
+                )
+                if use_cache_flag:
+                    if present is None:
+                        raise RuntimeError("Block did not return past_key_value for KV cache.")
+                    assert present_key_values is not None
+                    present_key_values.append(present)
+            else:
+                x = block(x)
+
+            if output_hidden_states_flag:
+                assert hidden_states is not None
+                x_hidden, _ = self.readout.forward_with_past(x)
+                hidden_states = (*hidden_states, x_hidden)
+
+        x_out, readout_state_out = self.readout.forward_with_past(x, past=readout_state)
         x_out = self.ln_f(x_out)
 
         logits_scale = 1.0
@@ -448,27 +630,44 @@ class GPT(PreTrainedModel):
             logits_scale = float(getattr(self.config, "hidden_size_base", 1024)) / float(self.config.hidden_size)
 
         if targets is not None:
-            # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x_out)
-            logits = logits.float()  # use tf32/fp32 for logits
-            logits = logits * logits_scale
+            logits = self.lm_head(x_out).float() * logits_scale
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
-        elif output_all_seq:
-            logits = self.lm_head(x_out[:, :, :])  # note: using list [-1] to preserve the time dim
-            logits = logits * logits_scale
-            loss = None
         else:
-            # inference-time mini-optimization: only forward the lm_head on the very last position
-            logits = self.lm_head(x_out[:, [-1], :])  # note: using list [-1] to preserve the time dim
-            logits = logits.float()  # use tf32/fp32 for logits
-            logits = logits * logits_scale
             loss = None
+            if output_all_seq or return_dict_flag:
+                logits = self.lm_head(x_out) * logits_scale
+            else:
+                logits = self.lm_head(x_out[:, [-1], :]).float() * logits_scale
 
-        # there are performance reasons why not returning logits is prudent, if not needed
         if not return_logits:
             logits = None
+        if not return_dict_flag:
+            return logits, loss
 
-        return logits, loss
+        past_out: tuple[PastKeyValue, ...] | None = None
+        if use_cache_flag:
+            assert present_key_values is not None
+            if readout_state_out is not None and present_key_values:
+                past0 = present_key_values[0]
+                if len(past0) >= 5:
+                    present_key_values[0] = (
+                        past0[0],
+                        past0[1],
+                        past0[2],
+                        past0[3],
+                        readout_state_out,
+                        past0[-1],
+                    )
+                else:
+                    present_key_values[0] = (past0[0], past0[1], readout_state_out, past0[-1])
+            past_out = tuple(present_key_values)
+        return CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_out,
+            hidden_states=hidden_states,
+            attentions=None,
+        )
 
     def crop_block_size(self, block_size):
         block_size_int = int(block_size)
@@ -522,9 +721,11 @@ class GPT(PreTrainedModel):
         super().save_pretrained(save_directory, safe_serialization=False)
 
     @classmethod
-    def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):
+    def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args: Any, **kwargs: Any) -> Any:
         config = kwargs.pop("config", None)
         if config is None:
             config = cls.config_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
         model = super().from_pretrained(pretrained_model_name_or_path, config=config, *model_args, **kwargs)
+        if isinstance(model, GPT):
+            model.tie_weights()
         return model
