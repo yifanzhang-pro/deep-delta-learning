@@ -261,7 +261,7 @@ class ResidualShortConvCompressor(nn.Module):
             read_init = float(read_init_raw)
         self.read = nn.Parameter(torch.full((self.value_channels,), read_init))
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_past: bool = False) -> torch.Tensor:
         # x: (B, T, d, d_v)
         B, T, d, dv = x.shape
         if d != self.hidden_size:
@@ -271,12 +271,18 @@ class ResidualShortConvCompressor(nn.Module):
 
         x_flat = x.reshape(B, T, self.residual_size)
         x_conv = self.shortconv(x_flat).reshape(B, T, d, dv)
-        return torch.sum(x_conv * self.read, dim=-1)
+        if return_past:
+            past = x_flat.transpose(1, 2)[:, :, -(self.shortconv.kernel_size - 1):].contiguous()
+            return torch.sum(x_conv * self.read, dim=-1), past
+        else:
+            return torch.sum(x_conv * self.read, dim=-1)
 
     def forward_with_past(
         self, x: torch.Tensor, *, past: torch.Tensor | None = None
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # past: (B, C, k-1) where C = hidden_size * value_channels
+        if past is None:
+            return self.forward(x, return_past=True)
         B, T, d, dv = x.shape
         if d != self.hidden_size:
             raise ValueError(f"Expected residual d={self.hidden_size}, got {d}.")
@@ -305,9 +311,8 @@ class ResidualShortConvCompressor(nn.Module):
             raise ValueError(f"Expected past with shape (B, C, {past_len}), got {tuple(past.shape)}")
 
         x_cat = torch.cat([past.to(device=x.device, dtype=x.dtype), x_t], dim=-1)  # (B, C, past_len+T)
-        weight = self.shortconv.conv.weight
+        weight = self.shortconv.weight.unsqueeze(1)
         y = F.conv1d(x_cat, weight, bias=None, stride=1, padding=0, groups=self.residual_size)  # (B, C, T)
-
         y_bt = y.transpose(1, 2).contiguous()  # (B, T, C)
         y_bt = apply_activation(y_bt, getattr(self.shortconv, "activation", None))
         y = y_bt.reshape(B, T, d, dv)
