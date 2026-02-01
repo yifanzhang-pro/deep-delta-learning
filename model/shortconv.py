@@ -8,7 +8,9 @@ import torch.nn.functional as F
 from pydantic import BaseModel, ConfigDict
 
 from .activations import ActivationName, apply_activation
-
+import math
+from causal_conv1d import causal_conv1d_fn
+from functools import partial
 
 class _Transpose12Contiguous(torch.autograd.Function):
     @staticmethod
@@ -57,22 +59,30 @@ class DepthwiseShortConv1d(nn.Module):
             raise ValueError(f"kernel_size must be positive, got {self.kernel_size}.")
         self.activation = activation
         self.shift_right1 = bool(shift_right1)
-        self.conv = nn.Conv1d(
-            hidden_size,
-            hidden_size,
-            kernel_size=self.kernel_size,
-            padding=0,
-            groups=hidden_size,
-            bias=False,
-        )
+        # if self.shift_right1:
+        #     self.conv = nn.Conv1d(
+        #         hidden_size,
+        #         hidden_size,
+        #         kernel_size=self.kernel_size,
+        #         padding=0,
+        #         groups=hidden_size,
+        #         bias=False,
+        #     )
+        # else:
+        self.weight = nn.Parameter(torch.empty(hidden_size, self.kernel_size))
+        bound = 1 / math.sqrt(self.kernel_size) 
+        nn.init.uniform_(self.weight, -bound, bound)
+        self.conv = partial(causal_conv1d_fn, weight=self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.transpose(1, 2).contiguous()  # (B, C, T)
-        pad_left = self.kernel_size - 1 + (1 if self.shift_right1 else 0)
-        x = F.pad(x, (pad_left, 0)).contiguous()
-        x = self.conv(x)
+        # pad_left = self.kernel_size - 1 + (1 if self.shift_right1 else 0)
         if self.shift_right1:
-            x = x[:, :, :-1]
+            # x = F.pad(x, (self.kernel_size, 0)).contiguous()
+            x = F.pad(x, (1, 0)).contiguous()
+            x = self.conv(x)[:, :, :-1]
+        else:
+            x = self.conv(x)  
         if x.device.type == "mps":
             x = _Transpose12Contiguous.apply(x)
         else:
