@@ -72,7 +72,7 @@ class DepthwiseShortConv1d(nn.Module):
         self.weight = nn.Parameter(torch.empty(hidden_size, self.kernel_size))
         bound = 1 / math.sqrt(self.kernel_size) 
         nn.init.uniform_(self.weight, -bound, bound)
-        self.conv = partial(causal_conv1d_fn, weight=self.weight)
+        # self.conv = partial(causal_conv1d_fn, weight=self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.transpose(1, 2).contiguous()  # (B, C, T)
@@ -80,9 +80,9 @@ class DepthwiseShortConv1d(nn.Module):
         if self.shift_right1:
             # x = F.pad(x, (self.kernel_size, 0)).contiguous()
             x = F.pad(x, (1, 0)).contiguous()
-            x = self.conv(x)[:, :, :-1]
+            x = causal_conv1d_fn(x, weight=self.weight)[:, :, :-1]
         else:
-            x = self.conv(x)  
+            x = causal_conv1d_fn(x, weight=self.weight)
         if x.device.type == "mps":
             x = _Transpose12Contiguous.apply(x)
         else:
