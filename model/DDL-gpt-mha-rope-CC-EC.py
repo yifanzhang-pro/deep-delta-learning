@@ -331,14 +331,17 @@ class ResidualShortConvCompressor(nn.Module):
                 f"({self.value_channels}), got {kernel_size}."
             )
         self.kernel_size = kernel_size
-        self.shortconv = nn.Conv1d(
-            self.hidden_size,
-            self.hidden_size,
-            kernel_size=self.kernel_size,
-            padding=0,
-            groups=self.hidden_size,
-            bias=False,
-        )
+        # self.shortconv = nn.Conv1d(
+        #     self.hidden_size,
+        #     self.hidden_size,
+        #     kernel_size=self.kernel_size,
+        #     padding=0,
+        #     groups=self.hidden_size,
+        #     bias=False,
+        # )
+        self.weight = nn.Parameter(torch.empty(self.hidden_size, self.kernel_size))
+        bound = 1 / math.sqrt(self.kernel_size)
+        nn.init.uniform_(self.weight, -bound, bound)
         read_init_raw = getattr(config, "ddl_state_read_init", None)
         if read_init_raw is None:
             read_init = 1.0 / float(self.value_channels)
@@ -355,15 +358,22 @@ class ResidualShortConvCompressor(nn.Module):
             raise ValueError(f"Expected residual d_v={self.value_channels}, got {dv}.")
 
         x_bt = x.reshape(B * T, d, dv)
-        if self.dv_shortconv_causal:
-            pad_left = self.kernel_size - 1
-            pad_right = 0
-        else:
-            pad_total = self.kernel_size - 1
-            pad_left = pad_total // 2
-            pad_right = pad_total - pad_left
-        x_bt = F.pad(x_bt, (pad_left, pad_right)).contiguous()
-        x_conv = self.shortconv(x_bt)
+        # if self.dv_shortconv_causal:
+        #     pad_left = self.kernel_size - 1
+        #     pad_right = 0
+        # else:
+        #     pad_total = self.kernel_size - 1
+        #     pad_left = pad_total // 2
+        #     pad_right = pad_total - pad_left
+        # x_bt = F.pad(x_bt, (pad_left, pad_right)).contiguous()
+        # x_conv = self.shortconv(x_bt)
+        
+        pad_total = self.kernel_size - 1
+        pad_left = pad_total // 2
+        M_padded = torch.nn.functional.pad(self.weight, (pad_total, pad_total))
+        b = torch.arange(pad_total + pad_left, pad_left - 1, -1, device=x.device)
+        new_weight = M_padded.unfold(dimension=-1, size=self.kernel_size, step=1)[:,b,:]
+        x_conv = torch.einsum('bdv,dkv->bdk', x_bt, new_weight)
         if int(x_conv.size(-1)) != dv:
             raise ValueError(f"Expected d_v shortconv to return length {dv}, got {int(x_conv.size(-1))}.")
         return torch.sum(x_conv.reshape(B, T, d, dv) * self.read, dim=-1)
