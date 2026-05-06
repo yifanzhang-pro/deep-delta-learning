@@ -198,7 +198,7 @@ def fwd_delta_kernel(
     X_ptr, K_ptr, V_in_ptr, C_in_ptr,
     W_v_ptr, B_v_ptr, W_beta_ptr, B_beta_ptr,
     X_new_ptr, Khat_ptr, Delta_v_ptr, Inv_norm_ptr, V_ptr, Beta_ptr,
-    N, BLOCK_D: tl.constexpr, BLOCK_DV: tl.constexpr,
+    N, D_actual, BLOCK_D: tl.constexpr, BLOCK_DV: tl.constexpr,
     EPS: tl.constexpr, V_SCALE: tl.constexpr
 ):
     pid = tl.program_id(0)
@@ -207,56 +207,57 @@ def fwd_delta_kernel(
 
     off_d = tl.arange(0, BLOCK_D)
     off_dv = tl.arange(0, BLOCK_DV)
+    mask_d = off_d < D_actual
 
-    # Calculate pointers
-    x_ptrs = X_ptr + pid * BLOCK_D * BLOCK_DV + off_d[:, None] * BLOCK_DV + off_dv[None, :]
-    k_ptrs = K_ptr + pid * BLOCK_D + off_d
-    v_in_ptrs = V_in_ptr + pid * BLOCK_D + off_d
-    c_in_ptrs = C_in_ptr + pid * BLOCK_D + off_d
+    # Calculate pointers (use D_actual for strides so non-power-of-2 D works)
+    x_ptrs = X_ptr + pid * D_actual * BLOCK_DV + off_d[:, None] * BLOCK_DV + off_dv[None, :]
+    k_ptrs = K_ptr + pid * D_actual + off_d
+    v_in_ptrs = V_in_ptr + pid * D_actual + off_d
+    c_in_ptrs = C_in_ptr + pid * D_actual + off_d
 
     # 1. Load K and compute normalized k_hat
-    k = tl.load(k_ptrs).to(tl.float32)
+    k = tl.load(k_ptrs, mask=mask_d, other=0.0).to(tl.float32)
     norm_sq = tl.sum(k * k) + EPS * EPS
     inv_norm = 1.0 / tl.sqrt(norm_sq)
     k_hat = k * inv_norm
     tl.store(Inv_norm_ptr + pid, inv_norm)
-    tl.store(Khat_ptr + pid * BLOCK_D + off_d, k_hat)
+    tl.store(Khat_ptr + pid * D_actual + off_d, k_hat, mask=mask_d)
 
     # 2. Compute Beta (fusing nn.Linear)
-    c_in = tl.load(c_in_ptrs).to(tl.float32)
-    w_beta = tl.load(W_beta_ptr + off_d).to(tl.float32)
+    c_in = tl.load(c_in_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+    w_beta = tl.load(W_beta_ptr + off_d, mask=mask_d, other=0.0).to(tl.float32)
     b_beta = tl.load(B_beta_ptr).to(tl.float32)
     beta_logit = tl.sum(c_in * w_beta) + b_beta
     beta = 2.0 / (1.0 + tl.exp(-beta_logit))
     tl.store(Beta_ptr + pid, beta)
 
     # 3. Compute V (fusing nn.Linear)
-    v_in = tl.load(v_in_ptrs).to(tl.float32)
-    w_v_ptrs = W_v_ptr + off_dv[:, None] * BLOCK_D + off_d[None, :]
-    w_v = tl.load(w_v_ptrs).to(tl.float32)
+    v_in = tl.load(v_in_ptrs, mask=mask_d, other=0.0).to(tl.float32)
+    w_v_ptrs = W_v_ptr + off_dv[:, None] * D_actual + off_d[None, :]
+    w_v = tl.load(w_v_ptrs, mask=mask_d[None, :], other=0.0).to(tl.float32)
     b_v = tl.load(B_v_ptr + off_dv).to(tl.float32)
     v_logits = tl.sum(w_v * v_in[None, :], axis=1) + b_v
     v = (1.0 / (1.0 + tl.exp(-v_logits))) * V_SCALE
     tl.store(V_ptr + pid * BLOCK_DV + off_dv, v)
 
     # 4. Update X
-    x = tl.load(x_ptrs).to(tl.float32)
+    x = tl.load(x_ptrs, mask=mask_d[:, None], other=0.0).to(tl.float32)
     proj = tl.sum(k_hat[:, None] * x, axis=0)
     delta_v = v - proj
     tl.store(Delta_v_ptr + pid * BLOCK_DV + off_dv, delta_v)
 
     update = beta * k_hat[:, None] * delta_v[None, :]
     x_new = x + update
-    
+
     # Store with native implicit casting
-    tl.store(X_new_ptr + pid * BLOCK_D * BLOCK_DV + off_d[:, None] * BLOCK_DV + off_dv[None, :], x_new)
+    tl.store(X_new_ptr + pid * D_actual * BLOCK_DV + off_d[:, None] * BLOCK_DV + off_dv[None, :], x_new, mask=mask_d[:, None])
 
 
 @triton.jit
 def bwd_delta_kernel(
     dY_ptr, X_ptr, Khat_ptr, Delta_v_ptr, Inv_norm_ptr, V_ptr, Beta_ptr,
     dX_ptr, dK_ptr, dV_logits_ptr, dBeta_logits_ptr,
-    N, BLOCK_D: tl.constexpr, BLOCK_DV: tl.constexpr, V_SCALE: tl.constexpr
+    N, D_actual, BLOCK_D: tl.constexpr, BLOCK_DV: tl.constexpr, V_SCALE: tl.constexpr
 ):
     pid = tl.program_id(0)
     if pid >= N:
@@ -264,15 +265,16 @@ def bwd_delta_kernel(
 
     off_d = tl.arange(0, BLOCK_D)
     off_dv = tl.arange(0, BLOCK_DV)
+    mask_d = off_d < D_actual
 
-    # Calculate pointers
-    dy_ptrs = dY_ptr + pid * BLOCK_D * BLOCK_DV + off_d[:, None] * BLOCK_DV + off_dv[None, :]
-    x_ptrs = X_ptr + pid * BLOCK_D * BLOCK_DV + off_d[:, None] * BLOCK_DV + off_dv[None, :]
-    khat_ptrs = Khat_ptr + pid * BLOCK_D + off_d
+    # Calculate pointers (use D_actual for strides)
+    dy_ptrs = dY_ptr + pid * D_actual * BLOCK_DV + off_d[:, None] * BLOCK_DV + off_dv[None, :]
+    x_ptrs = X_ptr + pid * D_actual * BLOCK_DV + off_d[:, None] * BLOCK_DV + off_dv[None, :]
+    khat_ptrs = Khat_ptr + pid * D_actual + off_d
 
-    dy = tl.load(dy_ptrs).to(tl.float32)
-    x = tl.load(x_ptrs).to(tl.float32)
-    khat = tl.load(khat_ptrs).to(tl.float32)
+    dy = tl.load(dy_ptrs, mask=mask_d[:, None], other=0.0).to(tl.float32)
+    x = tl.load(x_ptrs, mask=mask_d[:, None], other=0.0).to(tl.float32)
+    khat = tl.load(khat_ptrs, mask=mask_d, other=0.0).to(tl.float32)
     delta_v = tl.load(Delta_v_ptr + pid * BLOCK_DV + off_dv).to(tl.float32)
     inv_norm = tl.load(Inv_norm_ptr + pid).to(tl.float32)
     v = tl.load(V_ptr + pid * BLOCK_DV + off_dv).to(tl.float32)
@@ -283,7 +285,7 @@ def bwd_delta_kernel(
 
     # dX
     dx = dy - beta * khat[:, None] * dk_hat_proj[None, :]
-    tl.store(dX_ptr + pid * BLOCK_D * BLOCK_DV + off_d[:, None] * BLOCK_DV + off_dv[None, :], dx)
+    tl.store(dX_ptr + pid * D_actual * BLOCK_DV + off_d[:, None] * BLOCK_DV + off_dv[None, :], dx, mask=mask_d[:, None])
 
     # dV Logits (chain-ruled natively)
     dv = beta * dk_hat_proj
@@ -304,7 +306,7 @@ def bwd_delta_kernel(
 
     khat_dot_dkhat = tl.sum(khat * dkhat)
     dk = inv_norm * (dkhat - khat * khat_dot_dkhat)
-    tl.store(dK_ptr + pid * BLOCK_D + off_d, dk)
+    tl.store(dK_ptr + pid * D_actual + off_d, dk, mask=mask_d)
 
 
 class FusedDeepDeltaFunction(torch.autograd.Function):
@@ -312,7 +314,8 @@ class FusedDeepDeltaFunction(torch.autograd.Function):
     def forward(ctx, x, k_in, v_in, context, W_v, b_v, W_beta, b_beta, config_k_eps, config_v_scale):
         B, T, D, DV = x.shape
         N = B * T
-        BLOCK_D, BLOCK_DV = D, DV # DV==4
+        BLOCK_D = triton.next_power_of_2(D)  # must be power of 2 for tl.arange
+        BLOCK_DV = DV  # DV==4
 
         x_flat = x.view(N, D, DV).contiguous()
         k_flat = k_in.view(N, D).contiguous()
@@ -334,12 +337,13 @@ class FusedDeepDeltaFunction(torch.autograd.Function):
             x_flat, k_flat, v_in_flat, c_in_flat,
             W_v, b_v, W_beta, b_beta,
             x_new, khat, delta_v, inv_norm, v_val, beta_val,
-            N, BLOCK_D, BLOCK_DV,
+            N, D, BLOCK_D, BLOCK_DV,
             EPS=eps_adj, V_SCALE=config_v_scale,
             num_warps=8
         )
 
         ctx.save_for_backward(x_flat, khat, delta_v, inv_norm, v_val, beta_val, v_in_flat, c_in_flat, W_v, W_beta)
+        ctx.D = D
         ctx.BLOCK_D = BLOCK_D
         ctx.BLOCK_DV = BLOCK_DV
         ctx.V_SCALE = config_v_scale
@@ -352,7 +356,7 @@ class FusedDeepDeltaFunction(torch.autograd.Function):
         x_flat, khat, delta_v, inv_norm, v_val, beta_val, v_in_flat, c_in_flat, W_v, W_beta = ctx.saved_tensors
         N = x_flat.shape[0]
 
-        grad_output_flat = grad_output.view(N, ctx.BLOCK_D, ctx.BLOCK_DV).contiguous()
+        grad_output_flat = grad_output.view(N, ctx.D, ctx.BLOCK_DV).contiguous()
 
         dx = torch.empty_like(x_flat)
         dk = torch.empty_like(khat)
@@ -362,7 +366,7 @@ class FusedDeepDeltaFunction(torch.autograd.Function):
         bwd_delta_kernel[(N,)](
             grad_output_flat, x_flat, khat, delta_v, inv_norm, v_val, beta_val,
             dx, dk, dv_logits, dbeta_logits,
-            N, ctx.BLOCK_D, ctx.BLOCK_DV,
+            N, ctx.D, ctx.BLOCK_D, ctx.BLOCK_DV,
             V_SCALE=ctx.V_SCALE,
             num_warps=8
         )
@@ -370,19 +374,19 @@ class FusedDeepDeltaFunction(torch.autograd.Function):
         # Bulk parameter reductions
         dW_v = torch.matmul(dv_logits.t(), v_in_flat)
         db_v = dv_logits.sum(dim=0)
-        dv_in = torch.matmul(dv_logits, W_v).view(ctx.B, ctx.T, ctx.BLOCK_D)
+        dv_in = torch.matmul(dv_logits, W_v).view(ctx.B, ctx.T, ctx.D)
 
         dbeta_logits_unsqueezed = dbeta_logits.unsqueeze(1)
         dW_beta = torch.matmul(dbeta_logits_unsqueezed.t(), c_in_flat)
-        
+
         # FIXED: Removed the .squeeze(0) to maintain shape [1]
         db_beta = dbeta_logits.sum(dim=0, keepdim=True)
-        
-        dcontext = torch.matmul(dbeta_logits_unsqueezed, W_beta).view(ctx.B, ctx.T, ctx.BLOCK_D)
+
+        dcontext = torch.matmul(dbeta_logits_unsqueezed, W_beta).view(ctx.B, ctx.T, ctx.D)
 
         return (
-            dx.view(ctx.B, ctx.T, ctx.BLOCK_D, ctx.BLOCK_DV),
-            dk.view(ctx.B, ctx.T, ctx.BLOCK_D),
+            dx.view(ctx.B, ctx.T, ctx.D, ctx.BLOCK_DV),
+            dk.view(ctx.B, ctx.T, ctx.D),
             dv_in, dcontext,
             dW_v, db_v, dW_beta, db_beta,
             None, None
