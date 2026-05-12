@@ -58,7 +58,7 @@ Theorem 1 in the paper demonstrates that the eigenvalues of $\mathbf{A}(\mathbf{
 
 ## Depth-Wise Delta Rule
 
-DDL establishes a theoretical link to efficient sequence models like **DeltaNet**. While DeltaNet applies the "Delta Rule" ($\text{New} = \text{Old} + \beta(\text{Target} - \text{Old})$) over the time dimension, Deep Delta Learning applies it over the **depth dimension**.
+DDL establishes a theoretical link to efficient sequence models like **DeltaNet**. While DeltaNet applies the "Delta Rule" ( New $=$ Old $+ \beta($ Target  $-$ Old) ) over the time dimension, Deep Delta Learning applies it over the **depth dimension**.
 
 Expanding the DDL update reveals the classic Delta Rule structure:
 
