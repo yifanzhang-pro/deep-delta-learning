@@ -4,7 +4,7 @@
 [![Website](https://img.shields.io/badge/Project-Website-blue)](https://yifanzhang-pro.github.io/deep-delta-learning)
 [![License: CC-BY-4.0](https://img.shields.io/badge/License-CC_BY_4.0-yellow.svg)](https://creativecommons.org/licenses/by/4.0) 
 
-### Deep Delta Learning and Matrix Hidden States 
+### Deep Delta Learning 
 
 **Deep Delta Learning (DDL)** represents a paradigm shift in residual network design. It generalizes the standard additive residual connection by modulating the identity shortcut with a learnable, data-dependent geometric transformation known as the **Delta Operator**. 
 
