@@ -6,8 +6,8 @@
   <title>Deep Delta Learning</title>
 
   <!-- Meta: SEO / Academic -->
-  <meta name="description" content="Deep Delta Learning (DDL) generalizes standard residual connections via a learnable, data-dependent geometric transformation, unifying identity mapping, projection, and reflection.">
-  <meta name="keywords" content="Deep Delta Learning, DDL, Residual Networks, Deep Learning, Geometric Algebra, Householder Reflection, Neural ODEs">
+  <meta name="description" content="Deep Delta Learning (DDL) is a residual update for Transformers: each layer reads the residual state along a learned direction, compares the readout with a learned target, and writes back a gated rank-1 correction.">
+  <meta name="keywords" content="Deep Delta Learning, DDL, Residual Connections, Delta Rule, Transformers, Language Modeling">
   <meta name="citation_title" content="Deep Delta Learning">
   <meta name="citation_author" content="Yifan Zhang">
   <meta name="citation_author" content="Yifeng Liu">
@@ -15,7 +15,7 @@
   <meta name="citation_author" content="Quanquan Gu">
   <meta name="citation_publication_date" content="2026/01/01">
   <meta property="og:title" content="Deep Delta Learning"/>
-  <meta property="og:description" content="Generalizing residual connections with learnable Householder reflections."/>
+  <meta property="og:description" content="A gated read-compare-write residual update for Transformers."/>
   <meta property="og:type" content="website"/>
   <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' rx='22' fill='%230A0A0A'/%3E%3Ctext x='50' y='55' font-family='Arial,sans-serif' font-size='44' font-weight='700' fill='white' text-anchor='middle' dominant-baseline='central'%3EYZ%3C/text%3E%3C/svg%3E" type="image/svg+xml">
 
@@ -234,7 +234,7 @@
     "url":"https://yifanzhang-pro.github.io/deep-delta-learning/",
     "datePublished":"2026-01-01",
     "author":[{"@type":"Person","name":"Yifan Zhang"},{"@type":"Person","name":"Yifeng Liu"},{"@type":"Person","name":"Mengdi Wang"},{"@type":"Person","name":"Quanquan Gu"}],
-    "description":"Deep Delta Learning generalizes standard residual connections via a learnable, data-dependent geometric transformation."
+    "description":"Deep Delta Learning (DDL) is a residual update for Transformers: each layer reads the residual state along a learned direction, compares the readout with a learned target, and writes back a gated rank-1 correction."
   }
   </script>
 </head>
@@ -254,8 +254,10 @@
       <div id="navbarMenu" class="navbar-menu">
         <div class="navbar-end">
           <a href="#abstract" class="navbar-item">Abstract</a>
-          <a href="#method" class="navbar-item">The Delta Block</a>
+          <a href="#method" class="navbar-item">Method</a>
           <a href="#analysis" class="navbar-item">Analysis</a>
+          <a href="#results" class="navbar-item">Results</a>
+          <a href="#code" class="navbar-item">Code</a>
           <a href="#citation" class="navbar-item">Citation</a>
           <a href="https://yfz.ai/blog" class="navbar-item">Blog</a>
         </div>
@@ -269,7 +271,7 @@
       <div class="container has-text-centered">
         <h1 class="title">Deep Delta Learning</h1>
         <h2 class="subtitle is-hero-subtitle">
-          A generalization of residual networks where a single scalar <span class="highlight">gate</span> dynamically interpolates between <span class="highlight">identity, projection, and reflection</span>, enabling the modeling of complex, non-monotonic dynamics.
+          A residual update that <span class="highlight">reads</span> the state along a learned direction, <span class="highlight">compares</span> the readout with a learned target, and <span class="highlight">writes</span> back a gated rank-1 correction.
         </h2>
         <h3 class="subtitle is-5" style="color:rgba(255,255,255,0.9); margin-top:1rem;">
           <a href="https://yifzhang.com" target="_blank" rel="noopener" style="color:inherit; text-decoration:underline; text-underline-offset:2px;">Yifan Zhang</a><sup>1</sup>
@@ -286,10 +288,10 @@
           <a href="#citation" aria-label="Citation"><i class="fas fa-quote-right"></i></a>
         </div>
         <div style="margin-top:1.25rem;">
-          <span class="pill">Residual Learning</span>
-          <span class="pill">Geometric Algebra</span>
-          <span class="pill">Householder Reflection</span>
-          <span class="pill">Neural ODEs</span>
+          <span class="pill">Residual Connections</span>
+          <span class="pill">Delta Rule</span>
+          <span class="pill">Transformers</span>
+          <span class="pill">Language Modeling</span>
         </div>
       </div>
     </div>
@@ -302,10 +304,10 @@
         <h2 class="title is-3 has-text-centered section-title">Abstract</h2>
         <div class="content has-text-justified" style="max-width:880px;">
           <p>
-            The efficacy of deep residual networks is fundamentally predicated on the identity shortcut connection. While this mechanism effectively mitigates the vanishing gradient problem, it imposes a strictly additive inductive bias on feature transformations, thereby limiting the network's capacity to model complex state transitions.
+            Transformer residual streams evolve through additive updates. A sufficiently expressive residual block can represent content replacement, but standard architectures do not parameterize reading, comparison, and replacement as an explicit residual operation. We introduce <strong>Deep Delta Learning (DDL)</strong>, a structured residual update that keeps the identity path and adds target-seeking edits to the residual state. Each layer reads the current state along a learned direction, compares the readout with a learned target, and writes back a gated rank-1 correction along the same direction. Closing the gate recovers the identity map; a unit gate exactly overwrites the selected residual readout.
           </p>
           <p>
-            In this paper, we introduce <strong>Deep Delta Learning (DDL)</strong>, a novel architecture that generalizes the standard residual connection by modulating the identity shortcut with a learnable, data-dependent geometric transformation. This transformation, termed the <strong>Delta Operator</strong>, constitutes a rank-1 perturbation of the identity matrix, parameterized by a reflection direction vector $\kb(\Xb)$ and a gating scalar $\beta(\Xb)$. We provide a spectral analysis of this operator, demonstrating that the gate $\beta(\Xb)$ enables dynamic interpolation between identity mapping, orthogonal projection, and geometric reflection. Furthermore, we restructure the residual update as a synchronous rank-1 injection, where the gate acts as a dynamic step size governing both the erasure of old information and the writing of new features. This unification empowers the network to explicitly control the spectrum of its layer-wise transition operator, enabling the modeling of complex, non-monotonic dynamics while preserving the stable training characteristics of gated residual architectures.
+            We instantiate DDL with both scalar and expanded residual states. The expanded state stores multiple persistent value channels while attention and MLP computation stay at the original model width, so residual-state capacity can grow without widening the backbone. In controlled single-run pretraining comparisons at two scales, DDL improves validation loss and average one-shot downstream accuracy over additive residual baselines, with lower throughput in every measured configuration and higher peak memory for expanded states. These results suggest that depth-wise delta-rule updates provide a useful inductive bias for managing Transformer residual streams.
           </p>
           <p class="has-text-centered" style="margin-top:1.25rem;">
             <a class="button is-link is-light" href="https://github.com/yifanzhang-pro/deep-delta-learning" target="_blank" rel="noopener">
@@ -319,27 +321,37 @@
       </div>
     </section>
 
-    <!-- METHOD / BLOCK DIAGRAM -->
+    <!-- METHOD -->
     <section id="method" class="section content-section">
       <div class="container">
-        <h2 class="title is-3 has-text-centered section-title">The Delta Residual Block</h2>
+        <h2 class="title is-3 has-text-centered section-title">The Delta Residual Update</h2>
         <div class="content">
           <p>
-            Standard residual networks approximate the ODE $\dot{\Xb} = \Fb(\Xb)$ via an additive update $\Xb_{l+1} = \Xb_l + \Fb(\Xb_l)$. DDL generalizes this by applying a rank-1 transformation to the hidden state matrix $\Xb \in \RR^{d \times d_v}$. The Delta-Res block update rule is defined as:
+            For a residual state $\Xb_l \in \RR^{d \times d_v}$, DDL computes
           </p>
 
-          <p class="has-text-centered is-size-4 my-5">
+          <div class="math-block">
             $$
-            \Xb_{l+1} = \underbrace{(\Ib - \beta_l \kb_l \kb_l^\top)}_{\text{Delta Operator } \Ab(\Xb)} \Xb_l + \beta_l \kb_l \vb_l^\top
+            \Xb_{l+1} = \Xb_l + \beta_l \kb_l \bigl(\vb_l^\top - \kb_l^\top \Xb_l\bigr) = (\Ib - \beta_l \kb_l \kb_l^\top)\Xb_l + \beta_l \kb_l \vb_l^\top,
             $$
-          </p>
+          </div>
+
+          <ul>
+            <li>$\kb_l \in \RR^d$ is a unit read/write direction: the normalized output of the attention or MLP sublayer;</li>
+            <li>$\vb_l \in \RR^{d_v}$ is the target readout, produced by a lightweight branch;</li>
+            <li>$\beta_l = 2\sigma(\cdot) \in (0, 2)$ is a gate shared by erasure and writing.</li>
+          </ul>
 
           <div class="diagram-container">
-           <img src="DDL.png" alt="The Deep Delta Residual Block.">
-           </div>
-           <span class="mini-caption"><strong>Figure 1: The Deep Delta Residual Block.</strong> The architecture generalizes the standard residual connection. A learnable scalar gate $\beta$ controls a rank-1 geometric transformation.</span>
+            <img src="DDL.png" alt="Deep Delta Learning overview. (a) The residual rewrite: read, compare, and write steps next to the identity path. (b) A DDL Transformer sublayer: compress, normalize, attention or MLP, and rewrite, with value and gate branches.">
+          </div>
+          <span class="mini-caption"><strong>Figure 1: Deep Delta Learning overview.</strong> (a) Read the selected residual content, compare it with a target, and add a gated rank-1 correction to the identity path. (b) In a DDL Transformer sublayer, the attention or MLP output gives the direction; lightweight branches produce the target from the sublayer input $\mathbf{x}_l^{\mathrm{in}}$ and the gate from the normalized context $\mathbf{c}_l$. The expanded residual state persists across sublayers.</span>
+
+          <p class="mt-5">
+            With $d_v = 1$ the state is the ordinary residual vector. With $d_v > 1$ it stores several value channels, and a learned compressor gives each attention or MLP block a width-$d$ input, so the expensive sublayers are not widened.
+          </p>
           <p>
-             The network learns the reflection direction $\kb \in \RR^d$, the value vector $\vb \in \RR^{d_v}$, and the gate $\beta \in \RR$. This formulation couples the "erasure" of old information (via projection onto $\kb$) with the "writing" of new information (via injection of $\vb$), scaled synchronously by the gate $\beta$.
+            The update is still additive, so DDL does not enlarge the function class; it makes the edit target-seeking. After the update, the readout error along $\kb_l$ is multiplied by $1 - \beta_l$: closing the gate leaves the state unchanged, and $\beta_l = 1$ removes the error exactly.
           </p>
         </div>
       </div>
@@ -348,11 +360,10 @@
     <!-- ANALYSIS -->
     <section id="analysis" class="section content-section">
       <div class="container">
-        <h2 class="title is-3 has-text-centered section-title">Spectral Analysis & Geometric Unification</h2>
+        <h2 class="title is-3 has-text-centered section-title">Spectral Analysis</h2>
         <div class="content">
           <p>
-            The expressive power of DDL stems from the spectral properties of the Delta Operator $\Ab(\Xb)$, which are deterministically controlled by the gate $\beta$. 
-            The eigenvalues of $\Ab(\Xb)$ are $\{1, \dots, 1, 1-\beta\}$. This allows the network to interpolate between three fundamental linear transformations:
+            For a given direction $\kb$ and gate $\beta$, the shortcut $\Ab = \Ib - \beta \kb\kb^\top$ has eigenvalue $1$ on $\kb^\perp$ (multiplicity $d-1$) and $1-\beta$ along <span style="white-space:nowrap">$\kb$.</span> This gives three local regimes:
           </p>
 
           <div class="table-container">
@@ -360,48 +371,130 @@
               <thead>
                 <tr>
                   <th>Regime</th>
-                  <th>$\beta$ Value</th>
-                  <th>Spectrum</th>
-                  <th>Interpretation</th>
+                  <th>Gate</th>
+                  <th>Eigenvalue along $\kb$</th>
+                  <th>Effect on the readout $\kb^\top \Xb$</th>
                 </tr>
               </thead>
               <tbody>
                 <tr>
-                  <td><strong>Identity</strong></td>
-                  <td>$\beta \to 0$</td>
-                  <td>$\{1\}$</td>
-                  <td><strong>Skip Connection</strong>: Signal preservation for deep propagation. $\Xb_{l+1} \approx \Xb_l$.</td>
+                  <td><strong>Skip</strong></td>
+                  <td>$\beta \approx 0$</td>
+                  <td>$\approx 1$</td>
+                  <td>The update approaches the identity.</td>
                 </tr>
                 <tr>
-                  <td><strong>Projection</strong></td>
-                  <td>$\beta \to 1$</td>
-                  <td>$\{0, 1\}$</td>
-                  <td><strong>Forgetting</strong>: Orthogonal projection onto the hyperplane $\kb^\perp$, erasing components parallel to $\kb$. $\det(\Ab) \to 0$.</td>
+                  <td><strong>Target match</strong></td>
+                  <td>$\beta = 1$</td>
+                  <td>$0$</td>
+                  <td>The readout is replaced exactly by $\vb^\top$.</td>
                 </tr>
                 <tr>
-                  <td><strong>Reflection</strong></td>
-                  <td>$\beta \to 2$</td>
-                  <td>$\{-1, 1\}$</td>
-                  <td><strong>Householder Reflection</strong>: Inverts the state along $\kb$, introducing negative eigenvalues to model oscillatory/oppositional dynamics. $\det(\Ab) \to -1$.</td>
+                  <td><strong>Over-relaxed</strong></td>
+                  <td>$1 &lt; \beta &lt; 2$</td>
+                  <td>$1-\beta &lt; 0$</td>
+                  <td>The readout crosses the target. As $\beta \to 2$, the shortcut (not the full update) approaches the Householder reflector $\Ib - 2\kb\kb^\top$.</td>
                 </tr>
               </tbody>
             </table>
           </div>
 
+          <p>
+            This analysis describes the operator for a given direction and gate. It does not show that learned directions correspond to human-readable features.
+          </p>
+
           <h3 class="title is-4">Depth-Wise Delta Rule</h3>
           <p>
-            DDL establishes a theoretical link to efficient sequence models like <strong>DeltaNet</strong>. While DeltaNet applies the "Delta Rule" over the time dimension, Deep Delta Learning applies it over the <strong>depth dimension</strong>. Expanding the DDL update reveals the classic Delta Rule structure:
+            <strong>DeltaNet</strong> applies the delta rule over time to update a memory matrix. DDL applies the same erase/write update over network depth, as the residual interface between Transformer sublayers:
           </p>
 
-          <p class="has-text-centered is-size-5 my-4">
-             $$
-             \Xb_{l+1} = \Xb_l + \beta_l \kb_l (\underbrace{\vb_l^\top}_{\text{Target}} - \underbrace{\kb_l^\top \Xb_l}_{\text{Current Projection}})
-             $$
-          </p>
+          <div class="math-block">
+            $$
+            \Xb_{l+1} = \Xb_l + \beta_l \kb_l \bigl(\underbrace{\vb_l^\top}_{\text{target}} - \underbrace{\kb_l^\top \Xb_l}_{\text{readout}}\bigr)
+            $$
+          </div>
 
           <p>
-            This allows the network to selectively "clean" or "rewrite" specific feature subspaces layer-by-layer, preventing the accumulation of interference common in standard additive ResNets.
+            The rule itself is prior work; DDL's contribution is its depth-wise use and analysis.
           </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- RESULTS -->
+    <section id="results" class="section content-section">
+      <div class="container">
+        <h2 class="title is-3 has-text-centered section-title">Results</h2>
+        <div class="content">
+          <p>
+            Decoder-only models (~124M and ~353M parameters) trained on FineWeb-Edu for 49.15B tokens. Validation loss and average one-shot accuracy (%) over eight benchmarks:
+          </p>
+
+          <div class="table-container">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th>Model</th>
+                  <th>Small loss</th>
+                  <th>Small 1-shot</th>
+                  <th>Medium loss</th>
+                  <th>Medium 1-shot</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td>Baseline</td><td>2.8543</td><td>48.56</td><td>2.6053</td><td>53.96</td></tr>
+                <tr><td>DDL ($d_v=1$)</td><td>2.8482</td><td>48.73</td><td>2.6039</td><td>54.69</td></tr>
+                <tr><td>DDL-TC w/o EC</td><td>2.8355</td><td>48.91</td><td>2.5927</td><td>54.83</td></tr>
+                <tr><td>DDL-CC w/o EC</td><td>2.8321</td><td>49.13</td><td>2.5790</td><td>54.92</td></tr>
+                <tr><td>DDL-TC</td><td><strong>2.8299</strong></td><td><strong>49.47</strong></td><td>2.5905</td><td>54.86</td></tr>
+                <tr><td>DDL-CC</td><td>2.8329</td><td>49.29</td><td><strong>2.5758</strong></td><td><strong>55.14</strong></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <p>
+            TC compresses the expanded state over tokens, CC mixes its $d_v = 4$ value channels at each token, and EC initializes it with a convolution over token embeddings. Expanded-state variants cost throughput and memory: at the small scale, DDL-CC trains at 1158.0K tokens/s with 3.08 GB peak memory, against 1509.6K tokens/s and 2.94 GB for the baseline.
+          </p>
+          <p>
+            Each configuration was trained once with the same token budget, so these are point estimates, not compute-matched comparisons, and the expanded-state gains are not separated from the added residual capacity. The paper discusses these limits in detail.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- CODE -->
+    <section id="code" class="section content-section">
+      <div class="container">
+        <h2 class="title is-3 has-text-centered section-title">Code</h2>
+        <div class="content">
+          <p>
+            The <a href="https://github.com/yifanzhang-pro/deep-delta-learning" target="_blank" rel="noopener">repository</a> contains PyTorch implementations of every reported variant. The reported runs use each file's default configuration. Each <code>-accelerated</code> file is a Triton implementation of the same model for CUDA GPUs; the reference files also run on CPU.
+          </p>
+
+          <div class="table-container">
+            <table class="table">
+              <thead>
+                <tr><th>Paper name</th><th>Model file</th></tr>
+              </thead>
+              <tbody>
+                <tr><td>DDL ($d_v=1$)</td><td><code>model/DDL-vdim1-gpt-mha-rope-TC.py</code></td></tr>
+                <tr><td>DDL-TC w/o EC</td><td><code>model/DDL-gpt-mha-rope-TC.py</code></td></tr>
+                <tr><td>DDL-TC</td><td><code>model/DDL-gpt-mha-rope-TC-EC.py</code></td></tr>
+                <tr><td>DDL-CC w/o EC</td><td><code>model/DDL-gpt-mha-rope-CC.py</code></td></tr>
+                <tr><td>DDL-CC</td><td><code>model/DDL-gpt-mha-rope-CC-EC.py</code></td></tr>
+              </tbody>
+            </table>
+          </div>
+
+<pre><code>import importlib
+import torch
+
+ddl = importlib.import_module("model.DDL-gpt-mha-rope-CC-EC")  # file names contain hyphens
+config = ddl.GPTConfig()  # defaults: the ~124M model from the paper, d_v = 4
+model = ddl.GPT(config)
+input_ids = torch.randint(0, config.vocab_size, (1, 16))
+out = model(input_ids=input_ids, labels=input_ids)
+print(out.loss)</code></pre>
         </div>
       </div>
     </section>
@@ -435,8 +528,10 @@
       <div class="content has-text-centered">
         <p>
           <a href="#abstract">Abstract</a> &nbsp;&bull;&nbsp;
-          <a href="#method">The Delta Block</a> &nbsp;&bull;&nbsp;
+          <a href="#method">Method</a> &nbsp;&bull;&nbsp;
           <a href="#analysis">Analysis</a> &nbsp;&bull;&nbsp;
+          <a href="#results">Results</a> &nbsp;&bull;&nbsp;
+          <a href="#code">Code</a> &nbsp;&bull;&nbsp;
           <a href="#citation">Citation</a> &nbsp;&bull;&nbsp;
           <a href="https://yfz.ai/blog">Yifan's Blog</a>
         </p>

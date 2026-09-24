@@ -4,69 +4,70 @@
 [![Website](https://img.shields.io/badge/Project-Website-blue)](https://yifanzhang-pro.github.io/deep-delta-learning)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-### Deep Delta Learning 
-
-**Deep Delta Learning (DDL)** represents a paradigm shift in residual network design. It generalizes the standard additive residual connection by modulating the identity shortcut with a learnable, data-dependent geometric transformation known as the **Delta Operator**. 
-
 **Authors**: [Yifan Zhang](https://YFZ.ai), [Yifeng Liu](https://lauyikfung.github.io/), Mengdi Wang, Quanquan Gu  
 **Affiliations**: Princeton University, UCLA  
 **Date**: January 1st, 2026
 
 [[Webpage](https://yifanzhang-pro.github.io/deep-delta-learning)] [[Huggingface](https://huggingface.co/papers/2601.00417)] 
 
-![](DDL.png) 
+**Deep Delta Learning (DDL)** is a residual update for Transformers. Each layer reads the residual state along a learned direction, compares the readout with a learned target, and writes back a gated rank-1 correction along the same direction. Closing the gate recovers the identity map; a unit gate exactly overwrites the selected readout.
 
-By reinterpreting the residual block as a rank-1 Householder update, DDL unifies identity mapping, orthogonal projection, and geometric reflection into a single, continuously differentiable module. This allows the network to explicitly control the spectrum of its layer-wise transition operator, enabling the modeling of complex, non-monotonic dynamics while preserving the stable training characteristics of gated residual architectures.
+![Deep Delta Learning overview](DDL.png)
 
+**(a)** Read the selected residual content, compare it with a target, and add a gated rank-1 correction to the identity path. **(b)** In a DDL Transformer sublayer, the attention or MLP output gives the direction; lightweight branches produce the target from the sublayer input $\mathbf{x}_l^{\mathrm{in}}$ and the gate from the normalized context $\mathbf{c}_l$. The expanded residual state persists across sublayers, and attention and MLP stay at width $d$.
 
 ## Abstract
 
-The efficacy of deep residual networks is fundamentally predicated on the identity shortcut connection. While this mechanism effectively mitigates the vanishing gradient problem, it imposes a strictly additive inductive bias on feature transformations, thereby limiting the network's capacity to model complex state transitions.
+Transformer residual streams evolve through additive updates. A sufficiently expressive residual block can represent content replacement, but standard architectures do not parameterize reading, comparison, and replacement as an explicit residual operation. We introduce Deep Delta Learning (DDL), a structured residual update that keeps the identity path and adds target-seeking edits to the residual state. Each layer reads the current state along a learned direction, compares the readout with a learned target, and writes back a gated rank-1 correction along the same direction. Closing the gate recovers the identity map; a unit gate exactly overwrites the selected residual readout. We instantiate DDL with both scalar and expanded residual states. The expanded state stores multiple persistent value channels while attention and MLP computation stay at the original model width, so residual-state capacity can grow without widening the backbone. In controlled single-run pretraining comparisons at two scales, DDL improves validation loss and average one-shot downstream accuracy over additive residual baselines, with lower throughput in every measured configuration and higher peak memory for expanded states. These results suggest that depth-wise delta-rule updates provide a useful inductive bias for managing Transformer residual streams.
 
-In this paper, we introduce **Deep Delta Learning (DDL)**, a novel architecture that generalizes the standard residual connection by modulating the identity shortcut with a learnable, data-dependent geometric transformation. This transformation, termed the **Delta Operator**, constitutes a rank-1 perturbation of the identity matrix, parameterized by a reflection direction vector $\mathbf{k}(\mathbf{X})$ and a gating scalar $\beta(\mathbf{X})$. We provide a spectral analysis of this operator, demonstrating that the gate $\beta(\mathbf{X})$ enables dynamic interpolation between identity mapping, orthogonal projection, and geometric reflection. Furthermore, we restructure the residual update as a synchronous rank-1 injection, where the gate acts as a dynamic step size governing both the erasure of old information and the writing of new features. This unification empowers the network to explicitly control the spectrum of its layer-wise transition operator, enabling the modeling of complex, non-monotonic dynamics while preserving the stable training characteristics of gated residual architectures.
+## The Update
 
-## The Delta Residual Block
-
-Standard residual networks approximate the ODE $\dot{\mathbf{X}} = \mathcal{F}(\mathbf{X})$ via an additive update $\mathbf{X}_{l+1} = \mathbf{X}_l + \mathcal{F}(\mathbf{X}_l)$. DDL generalizes this by applying a rank-1 transformation to the hidden state matrix $\mathbf{X} \in \mathbb{R}^{d \times d_v}$.
-
-The Delta-Res block update rule is defined as:
+For a residual state $\mathbf{X}_l \in \mathbb{R}^{d \times d_v}$, DDL computes
 
 $$
-\mathbf{X}_{l+1} = \underbrace{(\mathbf{I} - \beta_l \mathbf{k}_l \mathbf{k}_l^\top)}_{\text{Delta Operator } \mathbf{A}(\mathbf{X})} \mathbf{X}_l + \beta_l \mathbf{k}_l \mathbf{v}_l^\top
+\mathbf{X}_{l+1} = \mathbf{X}_l + \beta_l \mathbf{k}_l \bigl(\mathbf{v}_l^\top - \mathbf{k}_l^\top \mathbf{X}_l\bigr) = (\mathbf{I} - \beta_l \mathbf{k}_l \mathbf{k}_l^\top)\mathbf{X}_l + \beta_l \mathbf{k}_l \mathbf{v}_l^\top,
 $$
 
-Where:
-* $\mathbf{k}_l \in \mathbb{R}^d$: The learned **Reflection Direction** (strictly normalized).
-* $\beta_l \in \mathbb{R}$: The learned **Scalar Gate**, mapped to $[0, 2]$.
-* $\mathbf{v}_l \in \mathbb{R}^{d_v}$: The **Residual Value Vector** carrying new information.
+where
 
-This formulation couples the "erasure" of old information (via projection onto $\mathbf{k}$) with the "writing" of new information (via injection of $\mathbf{v}$), scaled synchronously by the gate $\beta$.
+* $\mathbf{k}_l \in \mathbb{R}^d$ is a unit read/write direction: the normalized output of the attention or MLP sublayer;
+* $\mathbf{v}_l \in \mathbb{R}^{d_v}$ is the target readout, produced by a lightweight branch;
+* $\beta_l = 2\sigma(\cdot) \in (0, 2)$ is a gate shared by erasure and writing.
 
-## Spectral Analysis & Geometric Unification
+With $d_v = 1$ the state is the ordinary residual vector. With $d_v > 1$ it stores several value channels, and a learned compressor gives each attention or MLP block a width-$d$ input.
 
-The expressive power of DDL stems from the spectral properties of the Delta Operator $\mathbf{A}(\mathbf{X})$, which are deterministically controlled by the gate $\beta$.
+The update is still additive, so DDL does not enlarge the function class; it makes the edit target-seeking. After the update, the readout error along $\mathbf{k}_l$ is multiplied by $1 - \beta_l$.
 
+## Spectral Analysis
 
+For a given direction $\mathbf{k}$ and gate $\beta$, the shortcut $\mathbf{A} = \mathbf{I} - \beta \mathbf{k}\mathbf{k}^\top$ has eigenvalue $1$ on $\mathbf{k}^\perp$ (multiplicity $d-1$) and $1-\beta$ along $\mathbf{k}$. This gives three local regimes:
 
-Theorem 1 in the paper demonstrates that the eigenvalues of $\mathbf{A}(\mathbf{X})$ are $\{1, \dots, 1, 1-\beta\}$. This allows the network to interpolate between three fundamental linear transformations:
+| Regime | Gate | Eigenvalue along $\mathbf{k}$ | Effect on the readout $\mathbf{k}^\top \mathbf{X}$ |
+| :--- | :--- | :--- | :--- |
+| **Skip** | $\beta \approx 0$ | $\approx 1$ | The update approaches the identity. |
+| **Target match** | $\beta = 1$ | $0$ | The readout is replaced exactly by $\mathbf{v}^\top$. |
+| **Over-relaxed** | $1 < \beta < 2$ | $1 - \beta < 0$ | The readout crosses the target. As $\beta \to 2$, the shortcut (not the full update) approaches the Householder reflector $\mathbf{I} - 2\mathbf{k}\mathbf{k}^\top$. |
 
-| Regime | $\beta$ Value | Spectrum | Behavior | Interpretation |
-| :--- | :--- | :--- | :--- | :--- |
-| **Identity** | $\beta \to 0$ | $\{1\}$ | $\mathbf{X}_{l+1} \approx \mathbf{X}_l$ | **Skip Connection**: Signal preservation for deep propagation. |
-| **Projection** | $\beta \to 1$ | $\{0, 1\}$ | $\det(\mathbf{A}) \to 0$ | **Forgetting**: Orthogonal projection onto the hyperplane $\mathbf{k}^\perp$, erasing components parallel to $\mathbf{k}$. |
-| **Reflection** | $\beta \to 2$ | $\{-1, 1\}$ | $\det(\mathbf{A}) \to -1$ | **Householder Reflection**: Inverts the state along $\mathbf{k}$, introducing negative eigenvalues to model oscillatory/oppositional dynamics. |
+This analysis describes the operator for a given direction and gate. It does not show that learned directions correspond to human-readable features.
 
 ## Depth-Wise Delta Rule
 
-DDL establishes a theoretical link to efficient sequence models like **DeltaNet**. While DeltaNet applies the "Delta Rule" ( New $=$ Old $+ \beta($ Target  $-$ Old) ) over the time dimension, Deep Delta Learning applies it over the **depth dimension**.
+DeltaNet applies the delta rule over time to update a memory matrix. DDL applies the same erase/write update over network depth, as the residual interface between Transformer sublayers. The rule itself is prior work; DDL's contribution is its depth-wise use and analysis.
 
-Expanding the DDL update reveals the classic Delta Rule structure:
+## Results
 
-$$
-\mathbf{X}_{l+1} = \mathbf{X}_l + \beta_l \mathbf{k}_l (\underbrace{\mathbf{v}_l^\top}_{\text{Target}} - \underbrace{\mathbf{k}_l^\top \mathbf{X}_l}_{\text{Current Projection}})
-$$
+Decoder-only models (~124M and ~353M parameters) trained on FineWeb-Edu for 49.15B tokens. Validation loss and average one-shot accuracy (%) over eight benchmarks:
 
-This allows the network to selectively "clean" or "rewrite" specific feature subspaces layer-by-layer, preventing the accumulation of interference common in standard additive ResNets.
+| Model | Small loss | Small 1-shot | Medium loss | Medium 1-shot |
+| :--- | :---: | :---: | :---: | :---: |
+| Baseline | 2.8543 | 48.56 | 2.6053 | 53.96 |
+| DDL ($d_v=1$) | 2.8482 | 48.73 | 2.6039 | 54.69 |
+| DDL-TC w/o EC | 2.8355 | 48.91 | 2.5927 | 54.83 |
+| DDL-CC w/o EC | 2.8321 | 49.13 | 2.5790 | 54.92 |
+| DDL-TC | **2.8299** | **49.47** | 2.5905 | 54.86 |
+| DDL-CC | 2.8329 | 49.29 | **2.5758** | **55.14** |
+
+Expanded-state variants cost throughput and memory: at the small scale, DDL-CC trains at 1158.0K tokens/s with 3.08 GB peak memory, against 1509.6K tokens/s and 2.94 GB for the baseline. Each configuration was trained once with the same token budget, so these are point estimates, not compute-matched comparisons, and the expanded-state gains are not separated from the added residual capacity. The paper discusses these limits in detail.
 
 ## Code
 
