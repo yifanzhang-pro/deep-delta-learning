@@ -22,16 +22,20 @@ from typing import Any, cast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .modules.segmented_causal_lm import forward_packed_ddl
-from .modules.amp_utils import linear_fp32
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
+from .modules.segmented_causal_lm import forward_packed_ddl
 from .modules.activations import ActivationName
 from .modules.ddl_shortconv import CcResidualShortConvCompressor as _CcResidualShortConvCompressor
 from .modules.attention_dtype import AttentionDType
 from .modules.attention import CausalSelfAttention
 from .modules.mlp import MLP
+from .modules.kv_shift import keep_only_kv_shift_cache_states
+from .DDL_utils import (
+    FusedDeepDeltaFunction,
+    validate_expanded_delta_inputs,
+)
 from .gpt_base import (
     CausalLMForwardTuple,
     DecoderOnlyCausalLMPreTrainedModel,
@@ -50,9 +54,6 @@ from .gpt_base import (
     validate_past_key_values_length,
 )
 from .modules.rmsnorm import RMSNorm
-from .modules.kv_shift import (
-    keep_only_kv_shift_cache_states,
-)
 from .init_utils import init_gpt_weights
 from .pydantic_config import validate_pretrained_config_kwargs
 
@@ -64,47 +65,40 @@ def _logit(p: float) -> float:
 
 class ResidualShortConvCompressor(_CcResidualShortConvCompressor):
     def __init__(self, config: Any) -> None:
-        super().__init__(config, implementation="torch", module_name="DDL-gpt-mha-rope-CC")
+        super().__init__(config, implementation="triton_required", module_name="DDL-gpt-mha-rope-CC-accelerated")
 
 
 class DeepDeltaResidualExpanded(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config: Any):
         super().__init__()
         hidden_size = int(config.hidden_size)
         value_channels = int(getattr(config, "ddl_value_channels", 4))
         if value_channels <= 1:
             raise ValueError("ddl_value_channels must be > 1 for expanded-state DDL.")
+        self.hidden_size = hidden_size
         self.value_channels = value_channels
 
         self.residual_branch_mult = resolve_residual_branch_mult(config)
         self.k_eps = float(getattr(config, "ddl_k_eps", 1e-5))
         self.v_sigmoid = bool(getattr(config, "ddl_v_sigmoid", True))
-        self.v_sigmoid_scale: float = float(getattr(config, "ddl_v_sigmoid_scale", 4.0))
+        self.v_sigmoid_scale = float(getattr(config, "ddl_v_sigmoid_scale", 4.0))
         self.v_constant = bool(getattr(config, "ddl_v_constant", False))
-        self.v_constant_value: float = float(getattr(config, "ddl_v_constant_value", 2.0))
 
         self.beta_single_linear = bool(getattr(config, "ddl_beta_single_linear", True))
-        if self.beta_single_linear:
-            self.beta = nn.Linear(hidden_size, 1, bias=True)
-        else:
-            beta_hidden_size = int(getattr(config, "ddl_beta_hidden_size", 128))
-            if beta_hidden_size <= 0:
-                raise ValueError("ddl_beta_hidden_size must be positive.")
+        if not self.beta_single_linear or self.v_constant or not self.v_sigmoid:
+            raise ValueError(
+                "DDL-gpt-mha-rope-CC-accelerated requires ddl_beta_single_linear=True, "
+                "ddl_v_constant=False, and ddl_v_sigmoid=True."
+            )
 
-            self.beta_in = nn.Linear(hidden_size, beta_hidden_size, bias=False)
-            self.beta_out = nn.Linear(beta_hidden_size, 1, bias=True)
-
-        # v is a vector in R^{d_v} in the expanded-state regime.
+        self.beta = nn.Linear(hidden_size, 1, bias=True)
         self.v_proj = nn.Linear(hidden_size, self.value_channels, bias=True)
 
         beta_init = float(getattr(config, "ddl_beta_init", 0.0))
         beta_init = min(max(beta_init, 0.0), 2.0)
         beta_init_p = beta_init / 2.0
         with torch.no_grad():
-            if self.beta_single_linear:
-                self.beta.bias.fill_(_logit(beta_init_p))
-            else:
-                self.beta_out.bias.fill_(_logit(beta_init_p))
+            self.beta.bias.fill_(_logit(beta_init_p))
 
     def forward(
         self,
@@ -114,43 +108,34 @@ class DeepDeltaResidualExpanded(nn.Module):
         v_in: torch.Tensor,
         context: torch.Tensor,
     ) -> torch.Tensor:
-        # x: (B, T, d, d_v), k_in: (B, T, d), v_in: (B, T, d), context: (B, T, d)
-        # Keep large tensors in the model dtype; only compute `beta` in fp32 for stability.
-        k_dim = int(k_in.size(-1))
-        eps_rms = (self.k_eps * self.k_eps) / float(k_dim)
-        k_rms = F.rms_norm(k_in, [k_dim], eps=eps_rms)
-        k_scale = 1.0 / math.sqrt(k_dim)
+        validate_expanded_delta_inputs(
+            module_name="DDL-gpt-mha-rope-CC-accelerated",
+            x=x,
+            k_in=k_in,
+            v_in=v_in,
+            context=context,
+            hidden_size=self.hidden_size,
+            value_channels=self.value_channels,
+        )
+        if not (x.is_cuda and k_in.is_cuda and v_in.is_cuda and context.is_cuda):
+            raise RuntimeError("DDL-gpt-mha-rope-CC-accelerated requires CUDA tensors for fused Triton updates.")
 
-        # beta(X) in [0, 2]
-        if self.beta_single_linear:
-            beta_logits = linear_fp32(self.beta, context)
-        else:
-            beta_hidden = torch.tanh(linear_fp32(self.beta_in, context))
-            beta_logits = linear_fp32(self.beta_out, beta_hidden)
-        beta = 2.0 * torch.sigmoid(beta_logits)  # fp32
-
-        if x.ndim != 4:
-            raise ValueError(f"Expected x with shape (B, T, d, d_v), got {tuple(x.shape)}")
-        if int(x.size(-2)) != k_dim:
-            raise ValueError(f"Expected x feature dim {k_dim}, got {int(x.size(-2))}.")
-        if int(x.size(-1)) != self.value_channels:
-            raise ValueError(f"Expected x value channels {self.value_channels}, got {int(x.size(-1))}.")
-
-        # k^T X, row vector projection (B, T, d_v)
-        proj_rms = torch.sum(k_rms.unsqueeze(-1) * x, dim=-2, dtype=torch.float32)  # fp32
-        proj = proj_rms * k_scale
-
-        if self.v_constant:
-            v = torch.full_like(proj, self.v_constant_value)  # (B, T, d_v)
-        else:
-            v = self.v_proj(v_in)
-            if self.v_sigmoid:
-                v = torch.sigmoid(v) * self.v_sigmoid_scale
-
-        # X <- X + beta * k * (v^T - k^T X)
-        delta_row = (beta * (v - proj)) * k_scale  # fp32 (B, T, d_v)
-        update = k_rms.unsqueeze(-1) * delta_row.to(dtype=x.dtype).unsqueeze(-2)  # (B, T, d, d_v)
-        return apply_residual_branch_update(x, x + update, self.residual_branch_mult)
+        updated = cast(
+            torch.Tensor,
+            FusedDeepDeltaFunction.apply(
+                x,
+                k_in,
+                v_in,
+                context,
+                self.v_proj.weight,
+                self.v_proj.bias,
+                self.beta.weight,
+                self.beta.bias,
+                self.k_eps,
+                self.v_sigmoid_scale,
+            ),
+        )
+        return apply_residual_branch_update(x, updated, self.residual_branch_mult)
 
 
 class Block(nn.Module):
@@ -278,7 +263,7 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
     base_model_prefix = "nanogptpro"
     supports_gradient_checkpointing = True
 
-    def __init__(self, config: GPTConfig):
+    def __init__(self, config: Any):
         configure_decoder_only_model_config(config)
         super().__init__(config)
         self.config = config
@@ -291,9 +276,7 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
         )
         self.readout = ResidualShortConvCompressor(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        # weight tying between token embedding and LM head
-        self.tie_weights()  # https://paperswithcode.com/method/weight-tying
-        # Final RMSNorm defined in the network
+        self.tie_weights()
         self.ln_f = RMSNorm(config.hidden_size)
         init_gpt_weights(self, config)
 
@@ -388,11 +371,10 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
         x_emb = apply_token_mask(
             token_embeddings_or_inputs_embeds(self.transformer.wte, input_ids=idx, inputs_embeds=inputs_embeds),
             token_mask,
-        )  # (B, T, d)
+        )
         value_channels = int(getattr(self.config, "ddl_value_channels", 4))
-        x = x_emb.unsqueeze(-1).repeat(1, 1, 1, value_channels)  # (B, T, d, d_v)
+        x = x_emb.unsqueeze(-1).repeat(1, 1, 1, value_channels)
         hidden_states: tuple[torch.Tensor, ...] | None = (x_emb,) if output_hidden_states_flag else None
-
         present_key_values: list[PastKeyValue] | None = [] if use_cache_flag else None
 
         for layer_idx, block in enumerate(transformer_blocks):
@@ -418,7 +400,11 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
                 assert hidden_states is not None
                 hidden_states = (*hidden_states, self.readout(x))
 
-        x_out = self.readout(x)
+        if output_hidden_states_flag and len(transformer_blocks) > 0:
+            assert hidden_states is not None
+            x_out = cast(torch.Tensor, hidden_states[-1])
+        else:
+            x_out = self.readout(x)
         x_out = self.ln_f(x_out)
 
         logits_scale = logits_scale_for_config(self.config)
@@ -426,9 +412,13 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
         if targets is not None:
             logits = apply_float32_multiplier(self.lm_head(x_out).float(), logits_scale)
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
+            if not return_logits:
+                logits = None
         else:
             loss = None
-            if output_all_seq or return_dict_requested or hf_style_call:
+            if not return_logits:
+                logits = None
+            elif output_all_seq or return_dict_requested or hf_style_call:
                 logits = apply_float32_multiplier(self.lm_head(x_out).float(), logits_scale)
             else:
                 logits = apply_float32_multiplier(self.lm_head(x_out[:, [-1], :]).float(), logits_scale)
@@ -437,8 +427,6 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
         if use_cache_flag:
             assert present_key_values is not None
             past_out = tuple(present_key_values)
-        if not return_logits:
-            logits = None
         if not return_dict_flag:
             return causal_lm_output_to_tuple(
                 loss=loss,
@@ -447,6 +435,7 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
                 hidden_states=hidden_states,
                 attentions=None,
             )
+
         return CausalLMOutputWithPast(
             loss=cast(torch.FloatTensor | None, loss),
             logits=cast(torch.FloatTensor | None, logits),
@@ -455,7 +444,7 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
             attentions=None,
         )
 
-    def crop_block_size(self, block_size):
+    def crop_block_size(self, block_size: int) -> None:
         block_size_int = int(block_size)
         if block_size_int <= 0:
             raise ValueError(f"block_size must be a positive integer, got {block_size_int}.")
@@ -468,26 +457,22 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
 
         setattr(self.config, "block_size", block_size_int)
 
-    def estimate_mfu(self, fwdbwd_per_iter, dt):
-        """estimate model flops utilization (MFU) in units of A100 bfloat16 peak FLOPS"""
-        # first estimate the number of flops we do per iteration.
-        # see PaLM paper Appendix B as ref: https://arxiv.org/abs/2204.02311
-        N = self.get_num_params()
+    def estimate_mfu(self, fwdbwd_per_iter: int, dt: float) -> float:
+        n_params = self.get_num_params()
         cfg = self.config
-        L, H, Q, T = (
-            cfg.num_hidden_layers,
-            cfg.num_attention_heads,
-            cfg.hidden_size // cfg.num_attention_heads,
-            cfg.block_size,
+        flops_per_token = (
+            6 * n_params
+            + 12
+            * cfg.num_hidden_layers
+            * cfg.num_attention_heads
+            * (cfg.hidden_size // cfg.num_attention_heads)
+            * cfg.block_size
         )
-        flops_per_token = 6 * N + 12 * L * H * Q * T
-        flops_per_fwdbwd = flops_per_token * T
+        flops_per_fwdbwd = flops_per_token * cfg.block_size
         flops_per_iter = flops_per_fwdbwd * fwdbwd_per_iter
-        # express our flops throughput as ratio of A100 bfloat16 peak flops
-        flops_achieved = flops_per_iter * (1.0 / dt)  # per second
-        flops_promised = 312e12  # A100 GPU bfloat16 peak flops is 312 TFLOPS
-        mfu = flops_achieved / flops_promised
-        return mfu
+        flops_achieved = flops_per_iter * (1.0 / dt)
+        flops_promised = 312e12
+        return flops_achieved / flops_promised
 
     def get_num_params(self, non_embedding: bool = True) -> int:
         return super().get_num_params(non_embedding=non_embedding)

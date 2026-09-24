@@ -2,7 +2,7 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2601.00417-b31b1b.svg)](https://arxiv.org/abs/2601.00417)
 [![Website](https://img.shields.io/badge/Project-Website-blue)](https://yifanzhang-pro.github.io/deep-delta-learning)
-[![License: CC-BY-4.0](https://img.shields.io/badge/License-CC_BY_4.0-yellow.svg)](https://creativecommons.org/licenses/by/4.0) 
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 ### Deep Delta Learning 
 
@@ -67,6 +67,36 @@ $$
 $$
 
 This allows the network to selectively "clean" or "rewrite" specific feature subspaces layer-by-layer, preventing the accumulation of interference common in standard additive ResNets.
+
+## Code
+
+`model/` contains the PyTorch implementations of the language models in the paper. Each model file defines a `GPTConfig` and a `GPT` model (a Hugging Face `PreTrainedModel`). The reported runs use each file's default configuration; the defaults give the ~124M model, and the ~353M model sets `num_hidden_layers=24`, `num_attention_heads=8`, `hidden_size=1024`.
+
+| Paper name | Reference implementation | Triton implementation |
+| :--- | :--- | :--- |
+| DDL ($d_v=1$) | `DDL-vdim1-gpt-mha-rope-TC.py` | `DDL-vdim1-gpt-mha-rope-TC-accelerated.py` |
+| DDL-TC w/o EC | `DDL-gpt-mha-rope-TC.py` | `DDL-gpt-mha-rope-TC-accelerated.py` |
+| DDL-TC | `DDL-gpt-mha-rope-TC-EC.py` | `DDL-gpt-mha-rope-TC-EC-accelerated.py` |
+| DDL-CC w/o EC | `DDL-gpt-mha-rope-CC.py` | `DDL-gpt-mha-rope-CC-accelerated.py` |
+| DDL-CC | `DDL-gpt-mha-rope-CC-EC.py` | `DDL-gpt-mha-rope-CC-EC-accelerated.py` |
+
+TC compresses the expanded residual state with a causal convolution over tokens, CC mixes the $d_v$ value channels at each token, and EC initializes the expanded state with a causal convolution over token embeddings. Expanded-state variants use $d_v=4$.
+
+The code requires Python 3.14 and the packages in `requirements.txt`. The `-accelerated` files need Triton on a CUDA GPU; the reference files also run on CPU.
+
+```python
+import importlib
+import torch
+
+ddl = importlib.import_module("model.DDL-gpt-mha-rope-CC-EC")  # file names contain hyphens
+config = ddl.GPTConfig()  # defaults: the ~124M model from the paper, d_v = 4
+model = ddl.GPT(config)
+input_ids = torch.randint(0, config.vocab_size, (1, 16))
+out = model(input_ids=input_ids, labels=input_ids)
+print(out.loss)
+```
+
+The code is released under the [Apache License 2.0](LICENSE).
 
 ## Citation
 

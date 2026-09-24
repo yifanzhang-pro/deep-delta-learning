@@ -9,8 +9,8 @@ where d is the backbone width and d_v is a small value-channel expansion (defaul
 
 To interface with standard Transformer sublayers expecting inputs in R^d, we:
 - Start by replicating token embeddings across d_v channels.
-- Before each sublayer, compress the expanded residual with a depthwise short convolution along
-  `d_v` (optionally causal) and a learned read vector to produce a d-dimensional hidden.
+- Before each sublayer, compress the expanded residual with a short causal conv and a
+  learned read vector to produce a d-dimensional hidden.
 - Run pre-norm + sublayer to obtain k (used as the update direction).
 - Project v in R^{d_v} and apply the rank-1 write k v^T, synchronized with erasure k^T X.
 """
@@ -28,7 +28,7 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .modules.activations import ActivationName
-from .modules.ddl_shortconv import CcResidualShortConvCompressor as _CcResidualShortConvCompressor
+from .modules.ddl_shortconv import TemporalResidualShortConvCompressor as _TemporalResidualShortConvCompressor
 from .modules.attention_dtype import AttentionDType
 from .modules.attention import CausalSelfAttention
 from .modules.mlp import MLP
@@ -40,19 +40,24 @@ from .gpt_base import (
     apply_residual_branch_update,
     apply_token_mask,
     causal_lm_output_to_tuple,
-    prepare_ddl_attention_masks,
     resolve_input_ids_and_embeds,
     token_embeddings_or_inputs_embeds,
     configure_decoder_only_model_config,
+    prepare_ddl_attention_masks,
     logits_scale_for_config,
     should_treat_past_key_values_as_empty_prefill,
     resolve_residual_branch_mult,
     validate_past_key_values_length,
 )
+from .modules.kv_cache import maybe_get_cache_len
 from .modules.rmsnorm import RMSNorm
 from .modules.kv_shift import (
+    get_kv_cache_trailing_state_by_shape,
+    insert_kv_cache_prefix_states,
     keep_only_kv_shift_cache_states,
+    split_kv_cache_prefix_states,
 )
+from .DDL_utils import shortconv_kernel_size
 from .init_utils import init_gpt_weights
 from .pydantic_config import validate_pretrained_config_kwargs
 
@@ -62,9 +67,9 @@ def _logit(p: float) -> float:
     return math.log(p) - math.log(1.0 - p)
 
 
-class ResidualShortConvCompressor(_CcResidualShortConvCompressor):
+class ResidualShortConvCompressor(_TemporalResidualShortConvCompressor):
     def __init__(self, config: Any) -> None:
-        super().__init__(config, implementation="torch", module_name="DDL-gpt-mha-rope-CC")
+        super().__init__(config, implementation="torch", module_name="DDL-gpt-mha-rope-TC")
 
 
 class DeepDeltaResidualExpanded(nn.Module):
@@ -165,12 +170,13 @@ class Block(nn.Module):
         self.ln_1 = RMSNorm(config.hidden_size)
         self.ln_2 = RMSNorm(config.hidden_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, *, token_mask: torch.Tensor | None = None) -> torch.Tensor:
         # Apply pre-norm before sublayers (compress -> prenorm -> sublayer -> DDL update).
         x_in = self.compress(x)
         x_norm = self.ln_1(x_in)
         k_attn = self.attn(x_norm)
         x = self.ddl_attn(x, k_in=k_attn, v_in=x_in, context=x_norm)
+        x = apply_token_mask(x, token_mask)
 
         x_in = self.compress(x)
         x_norm = self.ln_2(x_in)
@@ -188,16 +194,23 @@ class Block(nn.Module):
         position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, PastKeyValue | None]:
         batch_size = int(x.shape[0])
-        attention_past_key_value = keep_only_kv_shift_cache_states(
+        attention_past_key_value, (conv_pre_attn, conv_pre_mlp) = split_kv_cache_prefix_states(
             past_key_value,
+            prefix_state_count=2,
+            batch_size=batch_size,
+        )
+        attention_past_key_value = keep_only_kv_shift_cache_states(
+            attention_past_key_value,
             use_k_shift=self.attn.use_k_shift,
             use_v_shift=self.attn.use_v_shift,
             k_state_shape=(batch_size, self.attn.n_head * self.attn.head_dim),
             v_state_shape=(batch_size, self.attn.n_head * self.attn.head_dim),
         )
-        x_in = self.compress(x)
+
+        _, token_mask = prepare_ddl_attention_masks(attention_mask, current_length=int(x.shape[1]))
+        x_in, conv_pre_attn_out = self.compress.forward_with_past(x, past=conv_pre_attn, token_mask=token_mask)
         x_norm = self.ln_1(x_in)
-        k_attn, present = self.attn.forward_with_past(
+        k_attn, present_attn = self.attn.forward_with_past(
             x_norm,
             past_key_value=attention_past_key_value,
             use_cache=use_cache,
@@ -205,11 +218,21 @@ class Block(nn.Module):
             position_ids=position_ids,
         )
         x = self.ddl_attn(x, k_in=k_attn, v_in=x_in, context=x_norm)
+        x = apply_token_mask(x, token_mask)
 
-        x_in = self.compress(x)
+        x_in, conv_pre_mlp_out = self.compress.forward_with_past(x, past=conv_pre_mlp, token_mask=token_mask)
         x_norm = self.ln_2(x_in)
         k_mlp = self.mlp(x_norm)
         x = self.ddl_mlp(x, k_in=k_mlp, v_in=x_in, context=x_norm)
+
+        present: PastKeyValue | None = None
+        if use_cache:
+            if present_attn is None:
+                raise RuntimeError("Attention did not return present_key_value for KV cache.")
+            if conv_pre_attn_out is not None and conv_pre_mlp_out is not None:
+                present = insert_kv_cache_prefix_states(present_attn, (conv_pre_attn_out, conv_pre_mlp_out))
+            else:
+                present = present_attn
         return x, present
 
 
@@ -251,7 +274,6 @@ class GPTConfig(PretrainedConfig):
     ddl_value_channels: int = 4
     ddl_state_shortconv_kernel_size: int = 4
     ddl_state_read_init: float | None = None
-    ddl_state_dv_shortconv_causal: bool = False
     ddl_k_eps: float = 1e-5
     ddl_beta_hidden_size: int = 128
     ddl_beta_single_linear: bool = True
@@ -267,10 +289,7 @@ class GPTConfig(PretrainedConfig):
         if type(reduction_version) is not int or reduction_version != 1:
             raise ValueError("Unsupported ddl_sequence_reduction_version; expected 1.")
         kwargs.setdefault("ddl_sequence_reduction_version", 1)
-        raw = dict(kwargs)
-        if "ddl_value_channels" in raw and "ddl_state_shortconv_kernel_size" not in raw:
-            raw["ddl_state_shortconv_kernel_size"] = raw["ddl_value_channels"]
-        super().__init__(**validate_pretrained_config_kwargs(type(self), raw))
+        super().__init__(**validate_pretrained_config_kwargs(type(self), kwargs))
 
 
 class GPT(DecoderOnlyCausalLMPreTrainedModel):
@@ -384,6 +403,42 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
 
         transformer_blocks = [cast(Block, block) for block in cast(nn.ModuleList, self.transformer.h)]
         validate_past_key_values_length(past_key_values, expected_num_layers=len(transformer_blocks))
+        readout_has_state = int(getattr(self.readout.shortconv, "kernel_size", 0)) > 1
+        layer_readout_states: list[torch.Tensor | None] = [None] * len(transformer_blocks)
+        shift_state_count = int(bool(getattr(self.config, "use_k_shift", False))) + int(
+            bool(getattr(self.config, "use_v_shift", False))
+        )
+        if past_key_values is not None and readout_has_state:
+            readout_kernel_size = int(getattr(self.readout.shortconv, "kernel_size", 0))
+            for layer_idx, layer_past in enumerate(past_key_values):
+                if maybe_get_cache_len(layer_past, batch_size=batch_size) is None:
+                    continue
+                block = transformer_blocks[layer_idx]
+                block_prefix_state_count = 2 if shortconv_kernel_size(getattr(block, "compress", None)) > 1 else 0
+                layer_readout_states[layer_idx] = get_kv_cache_trailing_state_by_shape(
+                    layer_past,
+                    expected_shape=(
+                        batch_size,
+                        int(
+                            getattr(
+                                self.readout,
+                                "residual_size",
+                                int(self.config.hidden_size) * int(getattr(self.config, "ddl_value_channels", 4)),
+                            )
+                        ),
+                        readout_kernel_size - 1,
+                    ),
+                    batch_size=batch_size,
+                    prefix_state_count=block_prefix_state_count + shift_state_count,
+                )
+        if output_hidden_states_flag and past_key_values is not None and readout_has_state:
+            if any(state is None for state in layer_readout_states):
+                raise NotImplementedError(
+                    "output_hidden_states with past_key_values requires cached readout states from a prior "
+                    "call with output_hidden_states=True."
+                )
+
+        readout_state = layer_readout_states[-1]
 
         x_emb = apply_token_mask(
             token_embeddings_or_inputs_embeds(self.transformer.wte, input_ids=idx, inputs_embeds=inputs_embeds),
@@ -392,6 +447,7 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
         value_channels = int(getattr(self.config, "ddl_value_channels", 4))
         x = x_emb.unsqueeze(-1).repeat(1, 1, 1, value_channels)  # (B, T, d, d_v)
         hidden_states: tuple[torch.Tensor, ...] | None = (x_emb,) if output_hidden_states_flag else None
+        layer_readout_state_outs: list[torch.Tensor | None] = [None] * len(transformer_blocks)
 
         present_key_values: list[PastKeyValue] | None = [] if use_cache_flag else None
 
@@ -416,9 +472,20 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
 
             if output_hidden_states_flag:
                 assert hidden_states is not None
-                hidden_states = (*hidden_states, self.readout(x))
+                x_hidden, layer_readout_state_out = self.readout.forward_with_past(
+                    x,
+                    past=layer_readout_states[layer_idx],
+                    token_mask=token_mask,
+                )
+                hidden_states = (*hidden_states, x_hidden)
+                layer_readout_state_outs[layer_idx] = layer_readout_state_out
 
-        x_out = self.readout(x)
+        if output_hidden_states_flag:
+            assert hidden_states is not None
+            x_out = cast(torch.Tensor, hidden_states[-1])
+            readout_state_out = layer_readout_state_outs[-1]
+        else:
+            x_out, readout_state_out = self.readout.forward_with_past(x, past=readout_state, token_mask=token_mask)
         x_out = self.ln_f(x_out)
 
         logits_scale = logits_scale_for_config(self.config)
@@ -436,6 +503,20 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
         past_out: tuple[PastKeyValue, ...] | None = None
         if use_cache_flag:
             assert present_key_values is not None
+            if present_key_values and readout_state_out is not None:
+                if output_hidden_states_flag:
+                    for layer_idx, layer_state_out in enumerate(layer_readout_state_outs):
+                        if layer_state_out is None:
+                            continue
+                        layer_items = list(cast(tuple[torch.Tensor, ...], present_key_values[layer_idx]))
+                        if len(layer_items) < 2:
+                            raise RuntimeError("Invalid past_key_value payload: expected at least key/value tensors.")
+                        present_key_values[layer_idx] = tuple([*layer_items[:-1], layer_state_out, layer_items[-1]])
+                else:
+                    last_items = list(cast(tuple[torch.Tensor, ...], present_key_values[-1]))
+                    if len(last_items) < 2:
+                        raise RuntimeError("Invalid past_key_value payload: expected at least key/value tensors.")
+                    present_key_values[-1] = tuple([*last_items[:-1], readout_state_out, last_items[-1]])
             past_out = tuple(present_key_values)
         if not return_logits:
             logits = None

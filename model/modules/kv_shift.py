@@ -1,20 +1,24 @@
+# pyright: reportMissingImports=false, reportInvalidTypeForm=false
 from __future__ import annotations
 
-from typing import Optional
+from collections.abc import Sequence
+from typing import TYPE_CHECKING, Any, Optional, cast
 
 import torch
 import torch.nn as nn
 
+from .kv_cache import is_cache_len_tensor
 from .kv_shift_torch import token_shift_torch
+from ..utils.triton_import_utils import import_triton_modules
 
-_TRITON_AVAILABLE = False
-try:
+if TYPE_CHECKING:
     import triton
     import triton.language as tl
-except ModuleNotFoundError:
-    _TRITON_AVAILABLE = False
-else:
-    _TRITON_AVAILABLE = True
+
+_triton_module, _tl_module, _TRITON_AVAILABLE = import_triton_modules()
+if _TRITON_AVAILABLE and _triton_module is not None and _tl_module is not None:
+    triton = cast(Any, _triton_module)
+    tl = cast(Any, _tl_module)
 
 
 def maybe_contiguous(x: torch.Tensor) -> torch.Tensor:
@@ -175,7 +179,8 @@ if _TRITON_AVAILABLE:
             def grid(meta):
                 return (batch_size, triton.cdiv(seq_len, meta["BLOCK_T"]), num_heads)
 
-            shift_fwd_kernel[grid](
+            fwd_kernel = cast(Any, shift_fwd_kernel)
+            fwd_kernel[grid](
                 x,
                 prev_weight,
                 curr_weight,
@@ -209,7 +214,8 @@ if _TRITON_AVAILABLE:
             def grid(meta):
                 return (batch_size, triton.cdiv(seq_len, meta["BLOCK_T"]), num_heads)
 
-            shift_bwd_kernel[grid](
+            bwd_kernel = cast(Any, shift_bwd_kernel)
+            bwd_kernel[grid](
                 x,
                 prev_weight,
                 curr_weight,
@@ -228,7 +234,7 @@ if _TRITON_AVAILABLE:
 
 def token_shift(x: torch.Tensor, prev_weight: torch.Tensor, curr_weight: torch.Tensor) -> torch.Tensor:
     if _TRITON_AVAILABLE and x.is_cuda and x.size(-1) in {16, 32, 64, 128}:
-        return TokenShift.apply(x, prev_weight, curr_weight)
+        return cast(torch.Tensor, TokenShift.apply(x, prev_weight, curr_weight))
     return token_shift_torch(x, prev_weight, curr_weight)
 
 
@@ -254,6 +260,16 @@ class ShiftLinear(nn.Module):
         self.shift_proj = nn.Linear(input_dim, num_heads, bias=shift_bias)
 
     def forward(self, x: torch.Tensor, shift_state: Optional[torch.Tensor] = None) -> torch.Tensor:
+        result, next_shift_state = self.forward_with_shift_state(x, shift_state)
+        if shift_state is not None:
+            shift_state.copy_(next_shift_state)
+        return result
+
+    def forward_with_shift_state(
+        self,
+        x: torch.Tensor,
+        shift_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if x.ndim != 3:
             raise ValueError(f"expected x of shape (B, T, D), got {tuple(x.shape)}")
 
@@ -266,7 +282,15 @@ class ShiftLinear(nn.Module):
         if seq_len > 1:
             prev_weight = alpha
             curr_weight = 1.0 - alpha
-            result_per_head = token_shift(out_per_head, prev_weight, curr_weight)
+            if shift_state is None:
+                result_per_head = token_shift(out_per_head, prev_weight, curr_weight)
+            else:
+                result_per_head = token_shift_torch(
+                    out_per_head,
+                    prev_weight,
+                    curr_weight,
+                    initial_state=shift_state,
+                )
         else:
             if shift_state is None:
                 result_per_head = out_per_head
@@ -277,8 +301,230 @@ class ShiftLinear(nn.Module):
                 )
 
         result_per_head = result_per_head.to(out.dtype)
+        return result_per_head.reshape(batch_size, seq_len, self.output_dim), out[:, -1, :]
 
-        if shift_state is not None:
-            shift_state.copy_(out[:, -1, :])
 
-        return result_per_head.reshape(batch_size, seq_len, self.output_dim)
+def _shape_matches(tensor: torch.Tensor, expected_shape: tuple[int, int]) -> bool:
+    return tuple(int(dim) for dim in tensor.shape) == expected_shape
+
+
+def get_kv_shift_states(
+    past_key_value: Sequence[torch.Tensor] | None,
+    *,
+    use_k_shift: bool,
+    use_v_shift: bool,
+    k_state_shape: tuple[int, int],
+    v_state_shape: tuple[int, int],
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    if past_key_value is None or (not use_k_shift and not use_v_shift):
+        return None, None
+
+    batch_size = int(k_state_shape[0])
+    end = len(past_key_value)
+    if end > 0 and is_cache_len_tensor(past_key_value[-1], batch_size=batch_size):
+        end -= 1
+
+    cursor = end
+    v_shift_state: torch.Tensor | None = None
+    if use_v_shift:
+        cursor -= 1
+        if cursor < 2 or not _shape_matches(past_key_value[cursor], v_state_shape):
+            raise ValueError("past_key_value is missing the cached V shift state required by use_v_shift=True.")
+        v_shift_state = past_key_value[cursor]
+
+    k_shift_state: torch.Tensor | None = None
+    if use_k_shift:
+        cursor -= 1
+        if cursor < 2 or not _shape_matches(past_key_value[cursor], k_state_shape):
+            raise ValueError("past_key_value is missing the cached K shift state required by use_k_shift=True.")
+        k_shift_state = past_key_value[cursor]
+
+    return k_shift_state, v_shift_state
+
+
+def append_kv_shift_states(
+    items: list[torch.Tensor],
+    *,
+    k_shift_state: torch.Tensor | None,
+    v_shift_state: torch.Tensor | None,
+    cache_len: torch.Tensor,
+) -> tuple[torch.Tensor, ...]:
+    if k_shift_state is not None:
+        items.append(k_shift_state)
+    if v_shift_state is not None:
+        items.append(v_shift_state)
+    items.append(cache_len)
+    return tuple(items)
+
+
+def project_with_optional_shift_state(
+    projection: nn.Module,
+    x: torch.Tensor,
+    *,
+    use_shift: bool,
+    shift_state: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    if not use_shift:
+        return projection(x), None
+    shift_projection = cast(ShiftLinear, projection)
+    return shift_projection.forward_with_shift_state(x, shift_state)
+
+
+def split_kv_cache_prefix_states(
+    past_key_value: Sequence[torch.Tensor] | None,
+    *,
+    prefix_state_count: int,
+    batch_size: int,
+) -> tuple[tuple[torch.Tensor, ...] | None, tuple[torch.Tensor | None, ...]]:
+    if prefix_state_count < 0:
+        raise ValueError(f"prefix_state_count must be >= 0, got {prefix_state_count}.")
+    empty_states = tuple(None for _ in range(prefix_state_count))
+    if past_key_value is None:
+        return None, empty_states
+
+    end = len(past_key_value)
+    cache_len: torch.Tensor | None = None
+    if end > 0 and is_cache_len_tensor(past_key_value[-1], batch_size=batch_size):
+        cache_len = past_key_value[-1]
+        end -= 1
+
+    if end < 2 + prefix_state_count:
+        return tuple(past_key_value), empty_states
+
+    prefix_states = tuple(past_key_value[2 : 2 + prefix_state_count])
+    if any(state.ndim < 3 or int(state.shape[0]) != batch_size for state in prefix_states):
+        return tuple(past_key_value), empty_states
+
+    attention_items = [past_key_value[0], past_key_value[1]]
+    attention_items.extend(past_key_value[2 + prefix_state_count : end])
+    if cache_len is not None:
+        attention_items.append(cache_len)
+    return tuple(attention_items), prefix_states
+
+
+def insert_kv_cache_prefix_states(
+    attention_present: Sequence[torch.Tensor],
+    prefix_states: Sequence[torch.Tensor],
+) -> tuple[torch.Tensor, ...]:
+    if len(attention_present) < 2:
+        raise ValueError("attention_present must contain at least key and value tensors.")
+    return (
+        attention_present[0],
+        attention_present[1],
+        *prefix_states,
+        *attention_present[2:],
+    )
+
+
+def find_kv_cache_state_by_shape(
+    past_key_value: Sequence[torch.Tensor] | None,
+    *,
+    expected_shape: tuple[int, ...],
+    batch_size: int,
+) -> torch.Tensor | None:
+    if past_key_value is None:
+        return None
+    end = len(past_key_value)
+    if end > 0 and is_cache_len_tensor(past_key_value[-1], batch_size=batch_size):
+        end -= 1
+    for tensor in reversed(past_key_value[2:end]):
+        if tuple(int(dim) for dim in tensor.shape) == expected_shape:
+            return tensor
+    return None
+
+
+def get_kv_cache_trailing_state_by_shape(
+    past_key_value: Sequence[torch.Tensor] | None,
+    *,
+    expected_shape: tuple[int, ...],
+    batch_size: int,
+    prefix_state_count: int = 0,
+    skip_trailing_states: int = 0,
+) -> torch.Tensor | None:
+    if prefix_state_count < 0:
+        raise ValueError(f"prefix_state_count must be >= 0, got {prefix_state_count}.")
+    if skip_trailing_states < 0:
+        raise ValueError(f"skip_trailing_states must be >= 0, got {skip_trailing_states}.")
+    if past_key_value is None:
+        return None
+    end = len(past_key_value)
+    if end > 0 and is_cache_len_tensor(past_key_value[-1], batch_size=batch_size):
+        end -= 1
+    index = end - 1 - skip_trailing_states
+    if index < 2 + prefix_state_count:
+        return None
+    tensor = past_key_value[index]
+    if tuple(int(dim) for dim in tensor.shape) != expected_shape:
+        return None
+    return tensor
+
+
+def count_kv_cache_trailing_states(
+    past_key_value: Sequence[torch.Tensor] | None,
+    *,
+    batch_size: int,
+    prefix_state_count: int = 0,
+) -> int:
+    if prefix_state_count < 0:
+        raise ValueError(f"prefix_state_count must be >= 0, got {prefix_state_count}.")
+    if past_key_value is None:
+        return 0
+    end = len(past_key_value)
+    if end > 0 and is_cache_len_tensor(past_key_value[-1], batch_size=batch_size):
+        end -= 1
+    return max(0, end - 2 - prefix_state_count)
+
+
+def keep_only_kv_shift_cache_states(
+    past_key_value: Sequence[torch.Tensor] | None,
+    *,
+    use_k_shift: bool,
+    use_v_shift: bool,
+    k_state_shape: tuple[int, int],
+    v_state_shape: tuple[int, int],
+) -> tuple[torch.Tensor, ...] | None:
+    if past_key_value is None:
+        return None
+    if len(past_key_value) < 2:
+        return tuple(past_key_value)
+
+    batch_size = int(k_state_shape[0])
+    end = len(past_key_value)
+    cache_len: torch.Tensor | None = None
+    if end > 0 and is_cache_len_tensor(past_key_value[-1], batch_size=batch_size):
+        cache_len = past_key_value[-1]
+        end -= 1
+
+    middle = list(past_key_value[2:end])
+
+    def pop_rightmost_shape(expected_shape: tuple[int, int]) -> torch.Tensor | None:
+        for index in range(len(middle) - 1, -1, -1):
+            if _shape_matches(middle[index], expected_shape):
+                return middle.pop(index)
+        return None
+
+    v_shift_state = pop_rightmost_shape(v_state_shape) if use_v_shift else None
+    k_shift_state = pop_rightmost_shape(k_state_shape) if use_k_shift else None
+
+    result = [past_key_value[0], past_key_value[1]]
+    if k_shift_state is not None:
+        result.append(k_shift_state)
+    if v_shift_state is not None:
+        result.append(v_shift_state)
+    if cache_len is not None:
+        result.append(cache_len)
+    return tuple(result)
+
+
+__all__ = [
+    "ShiftLinear",
+    "get_kv_shift_states",
+    "append_kv_shift_states",
+    "project_with_optional_shift_state",
+    "find_kv_cache_state_by_shape",
+    "get_kv_cache_trailing_state_by_shape",
+    "count_kv_cache_trailing_states",
+    "keep_only_kv_shift_cache_states",
+    "split_kv_cache_prefix_states",
+    "insert_kv_cache_prefix_states",
+]

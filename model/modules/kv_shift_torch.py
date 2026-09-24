@@ -6,7 +6,12 @@ import torch
 import torch.nn as nn
 
 
-def token_shift_torch(x: torch.Tensor, prev_weight: torch.Tensor, curr_weight: torch.Tensor) -> torch.Tensor:
+def token_shift_torch(
+    x: torch.Tensor,
+    prev_weight: torch.Tensor,
+    curr_weight: torch.Tensor,
+    initial_state: torch.Tensor | None = None,
+) -> torch.Tensor:
     if x.ndim != 4:
         raise ValueError(f"expected x of shape (B, T, H, D), got {tuple(x.shape)}")
     if prev_weight.ndim != 3:
@@ -15,7 +20,10 @@ def token_shift_torch(x: torch.Tensor, prev_weight: torch.Tensor, curr_weight: t
         raise ValueError(f"expected curr_weight of shape (B, T, H), got {tuple(curr_weight.shape)}")
 
     x_prev = torch.roll(x, shifts=1, dims=1)
-    x_prev[:, 0, :, :] = 0.0
+    if initial_state is None:
+        x_prev[:, 0, :, :] = 0.0
+    else:
+        x_prev[:, 0, :, :] = initial_state.view(x.shape[0], x.shape[2], x.shape[3])
     return x_prev * prev_weight.unsqueeze(-1) + x * curr_weight.unsqueeze(-1)
 
 
@@ -41,6 +49,16 @@ class ShiftLinearTorch(nn.Module):
         self.shift_proj = nn.Linear(input_dim, num_heads, bias=shift_bias)
 
     def forward(self, x: torch.Tensor, shift_state: Optional[torch.Tensor] = None) -> torch.Tensor:
+        result, next_shift_state = self.forward_with_shift_state(x, shift_state)
+        if shift_state is not None:
+            shift_state.copy_(next_shift_state)
+        return result
+
+    def forward_with_shift_state(
+        self,
+        x: torch.Tensor,
+        shift_state: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         if x.ndim != 3:
             raise ValueError(f"expected x of shape (B, T, D), got {tuple(x.shape)}")
 
@@ -51,7 +69,7 @@ class ShiftLinearTorch(nn.Module):
         out_per_head = out.view(batch_size, seq_len, self.num_heads, -1)
 
         if seq_len > 1:
-            result_per_head = token_shift_torch(out_per_head, alpha, 1.0 - alpha)
+            result_per_head = token_shift_torch(out_per_head, alpha, 1.0 - alpha, initial_state=shift_state)
         else:
             if shift_state is None:
                 result_per_head = out_per_head
@@ -62,8 +80,4 @@ class ShiftLinearTorch(nn.Module):
                 )
 
         result_per_head = result_per_head.to(out.dtype)
-
-        if shift_state is not None:
-            shift_state.copy_(out[:, -1, :])
-
-        return result_per_head.reshape(batch_size, seq_len, self.output_dim)
+        return result_per_head.reshape(batch_size, seq_len, self.output_dim), out[:, -1, :]

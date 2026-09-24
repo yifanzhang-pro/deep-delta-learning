@@ -1,18 +1,11 @@
 """
-Deep Delta Learning (DDL), expanded state (d_v > 1), on top of GPT (MHA + RoPE).
+Deep Delta Learning (DDL), scalar value limit (d_v=1), on top of GPT (MHA + RoPE).
 
 Implements the Delta update:
-    X_{l+1} = X_l + beta_l * k_l * (v_l^T - k_l^T X_l)
+    x_{l+1} = x_l + beta_l * (v_l - k_l^T x_l) * k_l
 
-The hidden state is treated as a matrix X in R^{d x d_v} (flattened in memory),
-where d is the backbone width and d_v is a small value-channel expansion (default: 4).
-
-To interface with standard Transformer sublayers expecting inputs in R^d, we:
-- Start by replicating token embeddings across d_v channels.
-- Before each sublayer, compress the expanded residual with a depthwise short convolution along
-  `d_v` (optionally causal) and a learned read vector to produce a d-dimensional hidden.
-- Run pre-norm + sublayer to obtain k (used as the update direction).
-- Project v in R^{d_v} and apply the rank-1 write k v^T, synchronized with erasure k^T X.
+In this implementation, `k` is the output of the corresponding sublayer
+(attention or MLP).
 """
 
 import math
@@ -28,10 +21,10 @@ from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from .modules.activations import ActivationName
-from .modules.ddl_shortconv import CcResidualShortConvCompressor as _CcResidualShortConvCompressor
 from .modules.attention_dtype import AttentionDType
 from .modules.attention import CausalSelfAttention
 from .modules.mlp import MLP
+from .modules.rotary import Rotary as _SharedRotary
 from .gpt_base import (
     CausalLMForwardTuple,
     DecoderOnlyCausalLMPreTrainedModel,
@@ -50,11 +43,10 @@ from .gpt_base import (
     validate_past_key_values_length,
 )
 from .modules.rmsnorm import RMSNorm
-from .modules.kv_shift import (
-    keep_only_kv_shift_cache_states,
-)
 from .init_utils import init_gpt_weights
 from .pydantic_config import validate_pretrained_config_kwargs
+
+Rotary = _SharedRotary
 
 
 def _logit(p: float) -> float:
@@ -62,26 +54,17 @@ def _logit(p: float) -> float:
     return math.log(p) - math.log(1.0 - p)
 
 
-class ResidualShortConvCompressor(_CcResidualShortConvCompressor):
-    def __init__(self, config: Any) -> None:
-        super().__init__(config, implementation="torch", module_name="DDL-gpt-mha-rope-CC")
-
-
-class DeepDeltaResidualExpanded(nn.Module):
+class DeepDeltaResidualVdim1(nn.Module):
     def __init__(self, config):
         super().__init__()
         hidden_size = int(config.hidden_size)
-        value_channels = int(getattr(config, "ddl_value_channels", 4))
-        if value_channels <= 1:
-            raise ValueError("ddl_value_channels must be > 1 for expanded-state DDL.")
-        self.value_channels = value_channels
 
         self.residual_branch_mult = resolve_residual_branch_mult(config)
         self.k_eps = float(getattr(config, "ddl_k_eps", 1e-5))
         self.v_sigmoid = bool(getattr(config, "ddl_v_sigmoid", True))
         self.v_sigmoid_scale: float = float(getattr(config, "ddl_v_sigmoid_scale", 4.0))
-        self.v_constant = bool(getattr(config, "ddl_v_constant", False))
-        self.v_constant_value: float = float(getattr(config, "ddl_v_constant_value", 2.0))
+        self.v_constant = bool(getattr(config, "ddl_v_dim1_constant", False))
+        self.v_constant_value: float = float(getattr(config, "ddl_v_dim1_constant_value", 2.0))
 
         self.beta_single_linear = bool(getattr(config, "ddl_beta_single_linear", True))
         if self.beta_single_linear:
@@ -94,8 +77,8 @@ class DeepDeltaResidualExpanded(nn.Module):
             self.beta_in = nn.Linear(hidden_size, beta_hidden_size, bias=False)
             self.beta_out = nn.Linear(beta_hidden_size, 1, bias=True)
 
-        # v is a vector in R^{d_v} in the expanded-state regime.
-        self.v_proj = nn.Linear(hidden_size, self.value_channels, bias=True)
+        # v is a scalar in the d_v=1 regime; project sublayer output to a scalar.
+        self.v_proj = nn.Linear(hidden_size, 1, bias=True)
 
         beta_init = float(getattr(config, "ddl_beta_init", 0.0))
         beta_init = min(max(beta_init, 0.0), 2.0)
@@ -106,15 +89,8 @@ class DeepDeltaResidualExpanded(nn.Module):
             else:
                 self.beta_out.bias.fill_(_logit(beta_init_p))
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        *,
-        k_in: torch.Tensor,
-        v_in: torch.Tensor,
-        context: torch.Tensor,
-    ) -> torch.Tensor:
-        # x: (B, T, d, d_v), k_in: (B, T, d), v_in: (B, T, d), context: (B, T, d)
+    def forward(self, x: torch.Tensor, *, k_in: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
+        # x: (B, T, C), k_in: (B, T, C), context: (B, T, C)
         # Keep large tensors in the model dtype; only compute `beta` in fp32 for stability.
         k_dim = int(k_in.size(-1))
         eps_rms = (self.k_eps * self.k_eps) / float(k_dim)
@@ -129,53 +105,44 @@ class DeepDeltaResidualExpanded(nn.Module):
             beta_logits = linear_fp32(self.beta_out, beta_hidden)
         beta = 2.0 * torch.sigmoid(beta_logits)  # fp32
 
-        if x.ndim != 4:
-            raise ValueError(f"Expected x with shape (B, T, d, d_v), got {tuple(x.shape)}")
-        if int(x.size(-2)) != k_dim:
-            raise ValueError(f"Expected x feature dim {k_dim}, got {int(x.size(-2))}.")
-        if int(x.size(-1)) != self.value_channels:
-            raise ValueError(f"Expected x value channels {self.value_channels}, got {int(x.size(-1))}.")
-
-        # k^T X, row vector projection (B, T, d_v)
-        proj_rms = torch.sum(k_rms.unsqueeze(-1) * x, dim=-2, dtype=torch.float32)  # fp32
+        # k^T x, scalar projection (B, T, 1)
+        proj_rms = torch.sum(k_rms * x, dim=-1, keepdim=True, dtype=torch.float32)  # fp32
         proj = proj_rms * k_scale
 
         if self.v_constant:
-            v = torch.full_like(proj, self.v_constant_value)  # (B, T, d_v)
+            v = torch.full_like(proj, self.v_constant_value)
         else:
-            v = self.v_proj(v_in)
+            # v(X) is scalar for d_v=1.
+            v = self.v_proj(x)
             if self.v_sigmoid:
                 v = torch.sigmoid(v) * self.v_sigmoid_scale
 
-        # X <- X + beta * k * (v^T - k^T X)
-        delta_row = (beta * (v - proj)) * k_scale  # fp32 (B, T, d_v)
-        update = k_rms.unsqueeze(-1) * delta_row.to(dtype=x.dtype).unsqueeze(-2)  # (B, T, d, d_v)
+        # x <- x + beta * k * (v - k^T x)
+        delta_scaled = ((beta * (v - proj)) * k_scale).to(dtype=x.dtype)  # (B, T, 1)
+        update = delta_scaled * k_rms
         return apply_residual_branch_update(x, x + update, self.residual_branch_mult)
 
 
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.compress = ResidualShortConvCompressor(config)
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
-        self.ddl_attn = DeepDeltaResidualExpanded(config)
-        self.ddl_mlp = DeepDeltaResidualExpanded(config)
+        self.ddl_attn = DeepDeltaResidualVdim1(config)
+        self.ddl_mlp = DeepDeltaResidualVdim1(config)
         # Define RMSNorm layers once in the module
         self.ln_1 = RMSNorm(config.hidden_size)
         self.ln_2 = RMSNorm(config.hidden_size)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Apply pre-norm before sublayers (compress -> prenorm -> sublayer -> DDL update).
-        x_in = self.compress(x)
-        x_norm = self.ln_1(x_in)
+    def forward(self, x):
+        # Apply pre-norm before sublayers
+        x_norm = self.ln_1(x)
         k_attn = self.attn(x_norm)
-        x = self.ddl_attn(x, k_in=k_attn, v_in=x_in, context=x_norm)
+        x = self.ddl_attn(x, k_in=k_attn, context=x_norm)
 
-        x_in = self.compress(x)
-        x_norm = self.ln_2(x_in)
+        x_norm = self.ln_2(x)
         k_mlp = self.mlp(x_norm)
-        x = self.ddl_mlp(x, k_in=k_mlp, v_in=x_in, context=x_norm)
+        x = self.ddl_mlp(x, k_in=k_mlp, context=x_norm)
         return x
 
     def forward_with_past(
@@ -187,29 +154,19 @@ class Block(nn.Module):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, PastKeyValue | None]:
-        batch_size = int(x.shape[0])
-        attention_past_key_value = keep_only_kv_shift_cache_states(
-            past_key_value,
-            use_k_shift=self.attn.use_k_shift,
-            use_v_shift=self.attn.use_v_shift,
-            k_state_shape=(batch_size, self.attn.n_head * self.attn.head_dim),
-            v_state_shape=(batch_size, self.attn.n_head * self.attn.head_dim),
-        )
-        x_in = self.compress(x)
-        x_norm = self.ln_1(x_in)
+        x_norm = self.ln_1(x)
         k_attn, present = self.attn.forward_with_past(
             x_norm,
-            past_key_value=attention_past_key_value,
+            past_key_value=past_key_value,
             use_cache=use_cache,
             attention_mask=attention_mask,
             position_ids=position_ids,
         )
-        x = self.ddl_attn(x, k_in=k_attn, v_in=x_in, context=x_norm)
+        x = self.ddl_attn(x, k_in=k_attn, context=x_norm)
 
-        x_in = self.compress(x)
-        x_norm = self.ln_2(x_in)
+        x_norm = self.ln_2(x)
         k_mlp = self.mlp(x_norm)
-        x = self.ddl_mlp(x, k_in=k_mlp, v_in=x_in, context=x_norm)
+        x = self.ddl_mlp(x, k_in=k_mlp, context=x_norm)
         return x, present
 
 
@@ -247,18 +204,14 @@ class GPTConfig(PretrainedConfig):
     embedding_init_std: float = 0.02
     # Factor for hidden (>=2D) param init; actual std = factor / sqrt(hidden_size)
     hidden_init_std_factor: float = 0.5
-    # DDL expanded-state knobs
-    ddl_value_channels: int = 4
-    ddl_state_shortconv_kernel_size: int = 4
-    ddl_state_read_init: float | None = None
-    ddl_state_dv_shortconv_causal: bool = False
+    # DDL (scalar value limit, d_v=1) knobs
     ddl_k_eps: float = 1e-5
     ddl_beta_hidden_size: int = 128
     ddl_beta_single_linear: bool = True
     ddl_v_sigmoid: bool = True
     ddl_v_sigmoid_scale: float = 4.0
-    ddl_v_constant: bool = False
-    ddl_v_constant_value: float = 2.0
+    ddl_v_dim1_constant: bool = False
+    ddl_v_dim1_constant_value: float = 2.0
     # Initialize beta; clamped to [0, 2]. Use 1.0 by default for baseline comparability.
     ddl_beta_init: float = 1.0
 
@@ -267,10 +220,7 @@ class GPTConfig(PretrainedConfig):
         if type(reduction_version) is not int or reduction_version != 1:
             raise ValueError("Unsupported ddl_sequence_reduction_version; expected 1.")
         kwargs.setdefault("ddl_sequence_reduction_version", 1)
-        raw = dict(kwargs)
-        if "ddl_value_channels" in raw and "ddl_state_shortconv_kernel_size" not in raw:
-            raw["ddl_state_shortconv_kernel_size"] = raw["ddl_value_channels"]
-        super().__init__(**validate_pretrained_config_kwargs(type(self), raw))
+        super().__init__(**validate_pretrained_config_kwargs(type(self), kwargs))
 
 
 class GPT(DecoderOnlyCausalLMPreTrainedModel):
@@ -289,7 +239,6 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
                 h=nn.ModuleList([Block(config) for _ in range(config.num_hidden_layers)]),
             )
         )
-        self.readout = ResidualShortConvCompressor(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         # weight tying between token embedding and LM head
         self.tie_weights()  # https://paperswithcode.com/method/weight-tying
@@ -385,13 +334,11 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
         transformer_blocks = [cast(Block, block) for block in cast(nn.ModuleList, self.transformer.h)]
         validate_past_key_values_length(past_key_values, expected_num_layers=len(transformer_blocks))
 
-        x_emb = apply_token_mask(
+        x = apply_token_mask(
             token_embeddings_or_inputs_embeds(self.transformer.wte, input_ids=idx, inputs_embeds=inputs_embeds),
             token_mask,
-        )  # (B, T, d)
-        value_channels = int(getattr(self.config, "ddl_value_channels", 4))
-        x = x_emb.unsqueeze(-1).repeat(1, 1, 1, value_channels)  # (B, T, d, d_v)
-        hidden_states: tuple[torch.Tensor, ...] | None = (x_emb,) if output_hidden_states_flag else None
+        )
+        hidden_states: tuple[torch.Tensor, ...] | None = (x,) if output_hidden_states_flag else None
 
         present_key_values: list[PastKeyValue] | None = [] if use_cache_flag else None
 
@@ -416,22 +363,21 @@ class GPT(DecoderOnlyCausalLMPreTrainedModel):
 
             if output_hidden_states_flag:
                 assert hidden_states is not None
-                hidden_states = (*hidden_states, self.readout(x))
+                hidden_states = (*hidden_states, x)
 
-        x_out = self.readout(x)
-        x_out = self.ln_f(x_out)
+        x = self.ln_f(x)
 
         logits_scale = logits_scale_for_config(self.config)
 
         if targets is not None:
-            logits = apply_float32_multiplier(self.lm_head(x_out).float(), logits_scale)
+            logits = apply_float32_multiplier(self.lm_head(x).float(), logits_scale)
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
         else:
             loss = None
             if output_all_seq or return_dict_requested or hf_style_call:
-                logits = apply_float32_multiplier(self.lm_head(x_out).float(), logits_scale)
+                logits = apply_float32_multiplier(self.lm_head(x).float(), logits_scale)
             else:
-                logits = apply_float32_multiplier(self.lm_head(x_out[:, [-1], :]).float(), logits_scale)
+                logits = apply_float32_multiplier(self.lm_head(x[:, [-1], :]).float(), logits_scale)
 
         past_out: tuple[PastKeyValue, ...] | None = None
         if use_cache_flag:

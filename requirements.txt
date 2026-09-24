@@ -1,0 +1,4 @@
+torch==2.12.0
+transformers==5.8.0
+pydantic>=2.13.4,<3
+triton==3.7.0; sys_platform == "linux"

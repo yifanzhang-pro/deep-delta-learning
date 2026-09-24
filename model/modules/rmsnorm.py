@@ -72,7 +72,7 @@ def group_norm(
 class RMSNorm(nn.Module):
     def __init__(
         self, hidden_size: int, elementwise_affine: bool = True, bias: bool = False, eps: float = 1e-5
-    ) -> RMSNorm:
+    ) -> None:
         super().__init__()
 
         self.hidden_size = hidden_size
@@ -129,7 +129,7 @@ class GroupNorm(nn.Module):
         bias: bool = False,
         eps: float = 1e-5,
         is_rms_norm: bool = False,
-    ) -> GroupNorm:
+    ) -> None:
         super().__init__()
 
         if hidden_size % num_groups != 0:

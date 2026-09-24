@@ -15,24 +15,48 @@ To interface with standard Transformer sublayers expecting inputs in R^d, we:
 - Project v in R^{d_v} and apply the rank-1 write k v^T, synchronized with erasure k^T X.
 """
 
+import math
+from dataclasses import dataclass
+from typing import Any, cast
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
-from dataclasses import dataclass
-from typing import Any
+from .modules.segmented_causal_lm import forward_packed_ddl
+from .modules.amp_utils import linear_fp32
 from transformers.configuration_utils import PretrainedConfig
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from transformers.modeling_utils import PreTrainedModel
 
-from .activations import ActivationName, apply_activation, validate_activation_name
-from .gpt_base import PastKeyValue
-from .kv_cache import append_preallocated, get_past_len, maybe_get_cache_len
-from .rmsnorm import RMSNorm
-from .kv_shift import ShiftLinear
+from .modules.activations import ActivationName
+from .modules.ddl_shortconv import CcResidualShortConvCompressor as _CcResidualShortConvCompressor
+from .modules.attention_dtype import AttentionDType
+from .modules.attention import CausalSelfAttention
+from .modules.input_embed import InputEmbedShortConvExpander
+from .modules.mlp import MLP
+from .gpt_base import (
+    CausalLMForwardTuple,
+    DecoderOnlyCausalLMPreTrainedModel,
+    PastKeyValue,
+    apply_float32_multiplier,
+    apply_residual_branch_update,
+    apply_token_mask,
+    causal_lm_output_to_tuple,
+    resolve_input_ids_and_embeds,
+    token_embeddings_or_inputs_embeds,
+    configure_decoder_only_model_config,
+    prepare_ddl_attention_masks,
+    logits_scale_for_config,
+    should_treat_past_key_values_as_empty_prefill,
+    resolve_residual_branch_mult,
+    validate_past_key_values_length,
+)
+from .modules.rmsnorm import RMSNorm
+from .modules.kv_shift import (
+    find_kv_cache_state_by_shape,
+    keep_only_kv_shift_cache_states,
+)
 from .init_utils import init_gpt_weights
 from .pydantic_config import validate_pretrained_config_kwargs
-from .rotary import Rotary, apply_rotary_emb
 
 
 def _logit(p: float) -> float:
@@ -40,343 +64,9 @@ def _logit(p: float) -> float:
     return math.log(p) - math.log(1.0 - p)
 
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.n_head = config.num_attention_heads
-        self.hidden_size = config.hidden_size
-        self.head_dim = config.head_dim
-        self.q_activation = validate_activation_name(getattr(config, "q_activation", None), field_name="q_activation")
-        self.k_activation = validate_activation_name(getattr(config, "k_activation", None), field_name="k_activation")
-        self.v_activation = validate_activation_name(getattr(config, "v_activation", None), field_name="v_activation")
-        self.use_k_shift = getattr(config, "use_k_shift", False)
-        self.use_v_shift = getattr(config, "use_v_shift", False)
-        self.use_output_gate = getattr(config, "use_output_gate", False)
-        # projections to per-head dimensions
-        self.c_q = nn.Linear(self.hidden_size, self.n_head * self.head_dim, bias=False)
-        if self.use_k_shift:
-            self.c_k = ShiftLinear(self.hidden_size, self.n_head * self.head_dim, self.n_head, bias=False)
-        else:
-            self.c_k = nn.Linear(self.hidden_size, self.n_head * self.head_dim, bias=False)
-        if self.use_v_shift:
-            self.c_v = ShiftLinear(self.hidden_size, self.n_head * self.head_dim, self.n_head, bias=False)
-        else:
-            self.c_v = nn.Linear(self.hidden_size, self.n_head * self.head_dim, bias=False)
-        # output projection maps back to embedding dim
-        self.c_proj = nn.Linear(self.n_head * self.head_dim, self.hidden_size, bias=False)
-        # initialize attn output proj with reduced std: factor/sqrt(hidden_size)/sqrt(layers)
-        with torch.no_grad():
-            factor = getattr(config, "hidden_init_std_factor", 0.5)
-            std = factor / math.sqrt(config.hidden_size) / math.sqrt(config.num_hidden_layers)
-            self.c_proj.weight.normal_(mean=0.0, std=std)
-        rope_ratio = float(getattr(config, "rope_ratio", 1.0))
-        self.rotary = Rotary(self.head_dim, base=getattr(config, "rope_base", 10000.0), rope_ratio=rope_ratio)
-        self.using_groupnorm = config.using_groupnorm
-        # QK RMSNorm (learnable) flag and layers
-        self.use_qk_rmsnorm = getattr(config, "use_qk_rmsnorm", True)
-        if self.use_qk_rmsnorm:
-            self.q_rms = RMSNorm(self.head_dim, eps=1e-5, elementwise_affine=True)
-            self.k_rms = RMSNorm(self.head_dim, eps=1e-5, elementwise_affine=True)
-        if self.using_groupnorm:
-            # Apply RMSNorm to each head's output dimension
-            self.subln = RMSNorm(self.head_dim, eps=1e-5, elementwise_affine=True)
-        if self.use_output_gate:
-            self.g_proj = nn.Linear(self.hidden_size, self.n_head * self.head_dim, bias=False)
-            if not self.using_groupnorm:
-                self.o_norm = RMSNorm(self.head_dim, eps=getattr(config, "rms_norm_eps", 1e-5), elementwise_affine=True)
-
-        kv_cache_slot_size = int(getattr(config, "kv_cache_slot_size", 128))
-        if kv_cache_slot_size <= 0:
-            raise ValueError(f"kv_cache_slot_size must be positive, got {kv_cache_slot_size}.")
-        self.kv_cache_slot_size = kv_cache_slot_size
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y, _ = self.forward_with_past(x)
-        return y
-
-    def forward_with_past(
-        self,
-        x: torch.Tensor,
-        *,
-        past_key_value: PastKeyValue | None = None,
-        use_cache: bool = False,
-        attention_mask: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, PastKeyValue | None]:
-        B, T, _ = x.size()  # batch size, sequence length, embedding dimensionality (hidden_size)
-        q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        if self.use_k_shift:
-            k = self.c_k(x, None).view(B, T, self.n_head, self.head_dim)
-        else:
-            k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
-        if self.use_v_shift:
-            v = self.c_v(x, None).view(B, T, self.n_head, self.head_dim)
-        else:
-            v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
-
-        q = apply_activation(q, self.q_activation)
-        k = apply_activation(k, self.k_activation)
-        v = apply_activation(v, self.v_activation)
-
-        past_len = 0
-        past_k: torch.Tensor | None = None
-        past_v: torch.Tensor | None = None
-        cache_len = maybe_get_cache_len(past_key_value, batch_size=B)
-        past_k_used: torch.Tensor | None = None
-        past_v_used: torch.Tensor | None = None
-        if past_key_value is not None:
-            if len(past_key_value) < 2:
-                raise ValueError("past_key_value must have at least 2 tensors: (key, value).")
-            past_k = past_key_value[0]
-            past_v = past_key_value[1]
-            past_len = get_past_len(past_k=past_k, cache_len=cache_len)
-            if cache_len is None:
-                past_k_used = past_k
-                past_v_used = past_v
-            else:
-                past_k_used = past_k[:, :, :past_len, :]
-                past_v_used = past_v[:, :, :past_len, :]
-
-        cos, sin = self.rotary(q, seq_len_offset=past_len)
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
-        # Apply learnable RMSNorm to Q and K if enabled
-        if self.use_qk_rmsnorm:
-            q = self.q_rms(q)
-            k = self.k_rms(k)
-
-        q_t = q.transpose(1, 2)
-        k_t = k.transpose(1, 2)
-        v_t = v.transpose(1, 2)
-
-        cache_tensors: list[torch.Tensor] | None = None
-        cache_len_out: torch.Tensor | None = None
-        if use_cache:
-            views, caches, cache_len_out = append_preallocated(
-                past=[past_k, past_v] if past_k is not None and past_v is not None else None,
-                cache_len=cache_len,
-                past_len=past_len,
-                new=[k_t, v_t],
-                slot_size=self.kv_cache_slot_size,
-            )
-            k_t, v_t = views
-            cache_tensors = caches
-        elif past_k_used is not None and past_v_used is not None:
-            k_t = torch.cat([past_k_used, k_t], dim=-2)
-            v_t = torch.cat([past_v_used, v_t], dim=-2)
-
-        total_len = int(k_t.shape[-2])
-        attn_mask: torch.Tensor | None = None
-        if attention_mask is not None:
-            if attention_mask.ndim != 2:
-                raise ValueError(f"attention_mask must have shape (B, S), got {tuple(attention_mask.shape)}")
-            if int(attention_mask.shape[0]) != B:
-                raise ValueError(f"attention_mask batch mismatch: expected {B}, got {int(attention_mask.shape[0])}")
-            if int(attention_mask.shape[1]) != total_len:
-                raise ValueError(
-                    f"attention_mask sequence mismatch: expected {total_len}, got {int(attention_mask.shape[1])}"
-                )
-            attn_mask = attention_mask.to(dtype=torch.bool)[:, None, None, :]
-
-        use_is_causal = past_len == 0 and attn_mask is None
-        if not use_is_causal:
-            if T > 1:
-                key_positions = torch.arange(total_len, device=x.device)
-                query_positions = past_len + torch.arange(T, device=x.device)
-                causal_mask = key_positions <= query_positions[:, None]
-            else:
-                causal_mask = torch.ones((T, total_len), dtype=torch.bool, device=x.device)
-            if attn_mask is not None:
-                attn_mask = attn_mask & causal_mask[None, None, :, :]
-            else:
-                attn_mask = causal_mask[None, None, :, :]
-
-        y = F.scaled_dot_product_attention(q_t, k_t, v_t, attn_mask=attn_mask, is_causal=use_is_causal)
-
-        if self.using_groupnorm:
-            # Apply RMSNorm directly to each head's output
-            y = self.subln(y)
-        elif self.use_output_gate:
-            y = self.o_norm(y)
-
-        if self.use_output_gate:
-            gate = self.g_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-            y = y * F.silu(gate)
-
-        y = y.transpose(1, 2).contiguous().reshape(B, T, self.n_head * self.head_dim)
-        y = self.c_proj(y)
-        present: PastKeyValue | None = None
-        if use_cache:
-            if cache_tensors is None or cache_len_out is None:
-                raise RuntimeError("KV cache append did not return expected cache tensors.")
-            present = (cache_tensors[0], cache_tensors[1], cache_len_out)
-        return y, present
-
-
-class MLP(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        # Calculate the floored hidden dimension size
-        hidden_dim = math.floor(8 / 3 * config.hidden_size)
-
-        # Split the linear projection into two parts for SwiGLU
-        self.c_fc1 = nn.Linear(config.hidden_size, hidden_dim, bias=False)
-        self.c_fc2 = nn.Linear(config.hidden_size, hidden_dim, bias=False)
-
-        # Output projection
-        self.c_proj = nn.Linear(hidden_dim, config.hidden_size, bias=False)
-        # initialize MLP output proj with reduced std: factor/sqrt(hidden_size)/sqrt(layers)
-        with torch.no_grad():
-            factor = getattr(config, "hidden_init_std_factor", 0.5)
-            std = factor / math.sqrt(config.hidden_size) / math.sqrt(config.num_hidden_layers)
-            self.c_proj.weight.normal_(mean=0.0, std=std)
-
-    def forward(self, x):
-        # Apply the first linear layer to produce two projections
-        x1 = self.c_fc1(x)
-        x2 = self.c_fc2(x)
-
-        # Apply the SwiGLU gating: SILU on one projection, and gate with the other
-        x = F.silu(x1) * x2
-
-        # Apply the final output projection
-        x = self.c_proj(x)
-        return x
-
-
-class InputEmbedShortConvExpander(nn.Module):
-    def __init__(self, config) -> None:
-        super().__init__()
-        self.hidden_size = int(getattr(config, "hidden_size"))
-        self.value_channels = int(getattr(config, "ddl_value_channels", 4))
-        if self.value_channels <= 1:
-            raise ValueError("ddl_value_channels must be > 1 for expanded-state DDL.")
-
-        kernel_size = int(getattr(config, "input_embed_shortconv_kernel_size", 4))
-        if kernel_size <= 0:
-            raise ValueError(f"input_embed_shortconv_kernel_size must be positive, got {kernel_size}.")
-        self.kernel_size = kernel_size
-
-        self.conv = nn.Conv1d(
-            self.hidden_size,
-            self.hidden_size * self.value_channels,
-            kernel_size=self.kernel_size,
-            padding=0,
-            groups=self.hidden_size,
-            bias=False,
-        )
-
-    def reset_parameters_identity(self) -> None:
-        with torch.no_grad():
-            self.conv.weight.zero_()
-            self.conv.weight[:, 0, self.kernel_size - 1] = 1.0
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, d) -> (B, T, d, d_v)
-        if x.ndim != 3:
-            raise ValueError(f"Expected x with shape (B, T, d), got {tuple(x.shape)}")
-        B, T, d = x.shape
-        if d != self.hidden_size:
-            raise ValueError(f"Expected x feature dim {self.hidden_size}, got {d}.")
-
-        x_t = x.transpose(1, 2).contiguous()  # (B, d, T)
-        pad_left = self.kernel_size - 1
-        x_t = F.pad(x_t, (pad_left, 0)).contiguous()
-        y = self.conv(x_t)  # (B, d*d_v, T)
-        y = y.transpose(1, 2).contiguous()  # (B, T, d*d_v)
-        return y.reshape(B, T, d, self.value_channels)
-
-    def forward_with_past(
-        self, x: torch.Tensor, *, past: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if x.ndim != 3:
-            raise ValueError(f"Expected x with shape (B, T, d), got {tuple(x.shape)}")
-        B, T, d = x.shape
-        if d != self.hidden_size:
-            raise ValueError(f"Expected x feature dim {self.hidden_size}, got {d}.")
-
-        x_t = x.transpose(1, 2).contiguous()  # (B, d, T)
-        past_len = self.kernel_size - 1
-        if past_len <= 0:
-            expanded = self.forward(x)
-            empty = x_t[:, :, :0].contiguous()
-            return expanded, empty
-
-        if past is None:
-            past = torch.zeros((B, d, past_len), device=x.device, dtype=x.dtype)
-        if past.ndim != 3 or int(past.shape[0]) != B or int(past.shape[1]) != d or int(past.shape[2]) != past_len:
-            raise ValueError(f"Expected past with shape (B, d, {past_len}), got {tuple(past.shape)}")
-
-        x_cat = torch.cat([past.to(device=x.device, dtype=x.dtype), x_t], dim=-1)  # (B, d, past_len+T)
-        y = self.conv(x_cat)  # (B, d*d_v, T)
-        y = y.transpose(1, 2).contiguous()  # (B, T, d*d_v)
-        expanded = y.reshape(B, T, d, self.value_channels)
-        past_out = x_cat[:, :, -past_len:].contiguous()
-        return expanded, past_out
-
-
-class ResidualShortConvCompressor(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.hidden_size = int(config.hidden_size)
-        self.value_channels = int(getattr(config, "ddl_value_channels", 4))
-        if self.value_channels <= 1:
-            raise ValueError("ddl_value_channels must be > 1 for expanded-state DDL.")
-
-        self.dv_shortconv_causal = bool(getattr(config, "ddl_state_dv_shortconv_causal", False))
-        kernel_size = int(getattr(config, "ddl_state_shortconv_kernel_size", 4))
-        if kernel_size <= 0:
-            raise ValueError(f"ddl_state_shortconv_kernel_size must be positive, got {kernel_size}.")
-        if kernel_size > self.value_channels:
-            raise ValueError(
-                "ddl_state_shortconv_kernel_size must be <= ddl_value_channels "
-                f"({self.value_channels}), got {kernel_size}."
-            )
-        self.kernel_size = kernel_size
-        # self.shortconv = nn.Conv1d(
-        #     self.hidden_size,
-        #     self.hidden_size,
-        #     kernel_size=self.kernel_size,
-        #     padding=0,
-        #     groups=self.hidden_size,
-        #     bias=False,
-        # )
-        self.weight = nn.Parameter(torch.empty(self.hidden_size, self.kernel_size))
-        bound = 1 / math.sqrt(self.kernel_size)
-        nn.init.uniform_(self.weight, -bound, bound)
-        read_init_raw = getattr(config, "ddl_state_read_init", None)
-        if read_init_raw is None:
-            read_init = 1.0 / float(self.value_channels)
-        else:
-            read_init = float(read_init_raw)
-        self.read = nn.Parameter(torch.full((self.value_channels,), read_init))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, d, d_v)
-        B, T, d, dv = x.shape
-        if d != self.hidden_size:
-            raise ValueError(f"Expected residual d={self.hidden_size}, got {d}.")
-        if dv != self.value_channels:
-            raise ValueError(f"Expected residual d_v={self.value_channels}, got {dv}.")
-
-        x_bt = x.reshape(B * T, d, dv)
-        # if self.dv_shortconv_causal:
-        #     pad_left = self.kernel_size - 1
-        #     pad_right = 0
-        # else:
-        #     pad_total = self.kernel_size - 1
-        #     pad_left = pad_total // 2
-        #     pad_right = pad_total - pad_left
-        # x_bt = F.pad(x_bt, (pad_left, pad_right)).contiguous()
-        # x_conv = self.shortconv(x_bt)
-        
-        pad_total = self.kernel_size - 1
-        pad_left = pad_total // 2
-        M_padded = torch.nn.functional.pad(self.weight, (pad_total, pad_total))
-        b = torch.arange(pad_total + pad_left, pad_left - 1, -1, device=x.device)
-        new_weight = M_padded.unfold(dimension=-1, size=self.kernel_size, step=1)[:,b,:]
-        x_conv = torch.einsum('bdv,dkv->bdk', x_bt, new_weight)
-        if int(x_conv.size(-1)) != dv:
-            raise ValueError(f"Expected d_v shortconv to return length {dv}, got {int(x_conv.size(-1))}.")
-        return torch.sum(x_conv.reshape(B, T, d, dv) * self.read, dim=-1)
+class ResidualShortConvCompressor(_CcResidualShortConvCompressor):
+    def __init__(self, config: Any) -> None:
+        super().__init__(config, implementation="torch", module_name="DDL-gpt-mha-rope-CC-EC")
 
 
 class DeepDeltaResidualExpanded(nn.Module):
@@ -388,6 +78,7 @@ class DeepDeltaResidualExpanded(nn.Module):
             raise ValueError("ddl_value_channels must be > 1 for expanded-state DDL.")
         self.value_channels = value_channels
 
+        self.residual_branch_mult = resolve_residual_branch_mult(config)
         self.k_eps = float(getattr(config, "ddl_k_eps", 1e-5))
         self.v_sigmoid = bool(getattr(config, "ddl_v_sigmoid", True))
         self.v_sigmoid_scale: float = float(getattr(config, "ddl_v_sigmoid_scale", 4.0))
@@ -434,9 +125,10 @@ class DeepDeltaResidualExpanded(nn.Module):
 
         # beta(X) in [0, 2]
         if self.beta_single_linear:
-            beta_logits = self.beta(context).float()
+            beta_logits = linear_fp32(self.beta, context)
         else:
-            beta_logits = self.beta_out(torch.tanh(self.beta_in(context))).float()
+            beta_hidden = torch.tanh(linear_fp32(self.beta_in, context))
+            beta_logits = linear_fp32(self.beta_out, beta_hidden)
         beta = 2.0 * torch.sigmoid(beta_logits)  # fp32
 
         if x.ndim != 4:
@@ -460,7 +152,7 @@ class DeepDeltaResidualExpanded(nn.Module):
         # X <- X + beta * k * (v^T - k^T X)
         delta_row = (beta * (v - proj)) * k_scale  # fp32 (B, T, d_v)
         update = k_rms.unsqueeze(-1) * delta_row.to(dtype=x.dtype).unsqueeze(-2)  # (B, T, d, d_v)
-        return x + update
+        return apply_residual_branch_update(x, x + update, self.residual_branch_mult)
 
 
 class Block(nn.Module):
@@ -495,11 +187,24 @@ class Block(nn.Module):
         past_key_value: PastKeyValue | None = None,
         use_cache: bool = False,
         attention_mask: torch.Tensor | None = None,
+        position_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, PastKeyValue | None]:
+        batch_size = int(x.shape[0])
+        attention_past_key_value = keep_only_kv_shift_cache_states(
+            past_key_value,
+            use_k_shift=self.attn.use_k_shift,
+            use_v_shift=self.attn.use_v_shift,
+            k_state_shape=(batch_size, self.attn.n_head * self.attn.head_dim),
+            v_state_shape=(batch_size, self.attn.n_head * self.attn.head_dim),
+        )
         x_in = self.compress(x)
         x_norm = self.ln_1(x_in)
         k_attn, present = self.attn.forward_with_past(
-            x_norm, past_key_value=past_key_value, use_cache=use_cache, attention_mask=attention_mask
+            x_norm,
+            past_key_value=attention_past_key_value,
+            use_cache=use_cache,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
         )
         x = self.ddl_attn(x, k_in=k_attn, v_in=x_in, context=x_norm)
 
@@ -516,7 +221,8 @@ class Block(nn.Module):
 
 @dataclass
 class GPTConfig(PretrainedConfig):
-    model_type = "nanogpt-pro"
+    ddl_sequence_reduction_version: int = 1
+    model_type = "nanogptpro"
     vocab_size: int = 50304
     num_hidden_layers: int = 12
     num_attention_heads: int = 6  # head dim 128 suggested by @Grad62304977
@@ -536,6 +242,7 @@ class GPTConfig(PretrainedConfig):
     q_activation: ActivationName | None = None
     k_activation: ActivationName | None = None
     v_activation: ActivationName | None = None
+    attention_dtype: AttentionDType = "auto"
 
     rope_ratio: float = 1.0  # Apply RoPE on the first rope_ratio*head_dim dimensions (must be in [0, 1])
     # Embedding init std (normal init for tied token embedding / LM head)
@@ -559,24 +266,24 @@ class GPTConfig(PretrainedConfig):
     ddl_beta_init: float = 1.0
 
     def __init__(self, **kwargs: Any) -> None:
+        reduction_version = kwargs.get("ddl_sequence_reduction_version", 1)
+        if type(reduction_version) is not int or reduction_version != 1:
+            raise ValueError("Unsupported ddl_sequence_reduction_version; expected 1.")
+        kwargs.setdefault("ddl_sequence_reduction_version", 1)
         raw = dict(kwargs)
         if "ddl_value_channels" in raw and "ddl_state_shortconv_kernel_size" not in raw:
             raw["ddl_state_shortconv_kernel_size"] = raw["ddl_value_channels"]
         super().__init__(**validate_pretrained_config_kwargs(type(self), raw))
 
 
-class GPT(PreTrainedModel):
+class GPT(DecoderOnlyCausalLMPreTrainedModel):
     config_class = GPTConfig
-    base_model_prefix = "nanogpt-pro"
+    base_model_prefix = "nanogptpro"
     supports_gradient_checkpointing = True
 
-    def __init__(self, config):
-        # if self is not a subclass of PreTrinedModel, then we need to call super().__init__()
-        # else we can just call super().__init__(config) to handle the config argument
-        if not isinstance(self, PreTrainedModel):
-            super().__init__()
-        else:
-            super().__init__(config)
+    def __init__(self, config: GPTConfig):
+        configure_decoder_only_model_config(config)
+        super().__init__(config)
         self.config = config
 
         self.transformer = nn.ModuleDict(
@@ -595,8 +302,8 @@ class GPT(PreTrainedModel):
         init_gpt_weights(self, config)
         self.input_embed.reset_parameters_identity()
 
-    def tie_weights(self) -> None:
-        self.lm_head.weight = self.transformer.wte.weight
+    def tie_weights(self, missing_keys: set[str] | None = None, recompute_mapping: bool = True) -> None:
+        super().tie_weights(missing_keys=missing_keys, recompute_mapping=recompute_mapping)
 
     def forward(
         self,
@@ -606,6 +313,7 @@ class GPT(PreTrainedModel):
         output_all_seq: bool = False,
         *,
         input_ids: torch.Tensor | None = None,
+        inputs_embeds: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
@@ -615,58 +323,104 @@ class GPT(PreTrainedModel):
         output_attentions: bool | None = None,
         return_dict: bool | None = None,
         cache_position: torch.Tensor | None = None,
+        cu_seqlens: torch.Tensor | None = None,
+        max_seqlen: int | None = None,
         **kwargs: Any,
-    ) -> CausalLMOutputWithPast | tuple[torch.Tensor | None, torch.Tensor | None]:
-        del position_ids, cache_position, kwargs
+    ) -> CausalLMOutputWithPast | CausalLMForwardTuple:
+        if cu_seqlens is None and max_seqlen is not None:
+            raise ValueError("max_seqlen requires cu_seqlens.")
+        if cu_seqlens is not None:
+            return forward_packed_ddl(
+                self,
+                idx=idx,
+                targets=targets,
+                return_logits=return_logits,
+                output_all_seq=output_all_seq,
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                labels=labels,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
+                return_dict=return_dict,
+                cache_position=cache_position,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+        del cache_position, kwargs
 
-        if (idx is None) == (input_ids is None):
-            raise ValueError("Exactly one of `idx` or `input_ids` must be provided.")
-        if idx is None:
-            idx = input_ids
+        hf_style_call = input_ids is not None or inputs_embeds is not None
+        supervised_call = labels is not None or targets is not None
+        return_dict_requested = return_dict is not None
+
+        idx, inputs_embeds, batch_size, current_length = resolve_input_ids_and_embeds(
+            idx,
+            input_ids,
+            inputs_embeds,
+        )
 
         if labels is not None and targets is not None:
             raise ValueError("Only one of `labels` or `targets` can be provided.")
         if targets is None:
             targets = labels
 
-        use_cache_flag = bool(use_cache) if use_cache is not None else False
-        return_dict_flag = bool(return_dict) if return_dict is not None else False
+        use_cache_flag = (
+            bool(use_cache)
+            if use_cache is not None
+            else (bool(getattr(self.config, "use_cache", False)) if hf_style_call and not supervised_call else False)
+        )
+        return_dict_flag = (
+            bool(return_dict)
+            if return_dict is not None
+            else (bool(getattr(self.config, "return_dict", False)) if hf_style_call else False)
+        )
         output_hidden_states_flag = bool(output_hidden_states) if output_hidden_states is not None else False
         output_attentions_flag = bool(output_attentions) if output_attentions is not None else False
+        if should_treat_past_key_values_as_empty_prefill(past_key_values):
+            past_key_values = None
 
         if output_attentions_flag:
             raise NotImplementedError("output_attentions=True is not currently supported for DDL models.")
 
-        if attention_mask is not None and bool(attention_mask.to(dtype=torch.bool).all().item()):
-            attention_mask = None
+        attention_mask, token_mask = prepare_ddl_attention_masks(attention_mask, current_length=current_length)
 
+        transformer_blocks = [cast(Block, block) for block in cast(nn.ModuleList, self.transformer.h)]
+        validate_past_key_values_length(past_key_values, expected_num_layers=len(transformer_blocks))
         embed_state: torch.Tensor | None = None
-        if past_key_values is not None:
-            past0 = past_key_values[0]
-            if len(past0) >= 4 and self.input_embed.kernel_size > 1:
-                embed_state = past0[2]
+        if past_key_values is not None and self.input_embed.kernel_size > 1:
+            embed_state = find_kv_cache_state_by_shape(
+                past_key_values[0],
+                expected_shape=(batch_size, int(self.config.hidden_size), self.input_embed.kernel_size - 1),
+                batch_size=batch_size,
+            )
 
-        x_emb = self.transformer.wte(idx)  # (B, T, d)
+        x_emb = apply_token_mask(
+            token_embeddings_or_inputs_embeds(self.transformer.wte, input_ids=idx, inputs_embeds=inputs_embeds),
+            token_mask,
+        )  # (B, T, d)
         if self.input_embed.kernel_size > 1:
-            x, embed_state_out = self.input_embed.forward_with_past(x_emb, past=embed_state)
+            x, embed_state_out = self.input_embed.forward_with_past(x_emb, past=embed_state, token_mask=token_mask)
         else:
             x = self.input_embed(x_emb)
             embed_state_out = None
+        x = apply_token_mask(x, token_mask)
 
         hidden_states: tuple[torch.Tensor, ...] | None = (x_emb,) if output_hidden_states_flag else None
 
         present_key_values: list[PastKeyValue] | None = [] if use_cache_flag else None
-        if past_key_values is not None and len(past_key_values) != len(self.transformer.h):
-            raise ValueError(f"past_key_values must have length {len(self.transformer.h)}, got {len(past_key_values)}.")
 
-        for layer_idx, block in enumerate(self.transformer.h):
-            if use_cache_flag or past_key_values is not None or attention_mask is not None:
+        for layer_idx, block in enumerate(transformer_blocks):
+            if use_cache_flag or past_key_values is not None or attention_mask is not None or position_ids is not None:
                 past = past_key_values[layer_idx] if past_key_values is not None else None
                 x, present = block.forward_with_past(
                     x,
                     past_key_value=past,
                     use_cache=use_cache_flag,
                     attention_mask=attention_mask,
+                    position_ids=position_ids,
                 )
                 if use_cache_flag:
                     if present is None:
@@ -675,6 +429,7 @@ class GPT(PreTrainedModel):
                     present_key_values.append(present)
             else:
                 x = block(x)
+            x = apply_token_mask(x, token_mask)
 
             if output_hidden_states_flag:
                 assert hidden_states is not None
@@ -683,37 +438,40 @@ class GPT(PreTrainedModel):
         x_out = self.readout(x)
         x_out = self.ln_f(x_out)
 
-        logits_scale = 1.0
-        if getattr(self.config, "mup", False):
-            logits_scale = float(getattr(self.config, "hidden_size_base", 1024)) / float(self.config.hidden_size)
+        logits_scale = logits_scale_for_config(self.config)
 
         if targets is not None:
-            logits = self.lm_head(x_out).float() * logits_scale
+            logits = apply_float32_multiplier(self.lm_head(x_out).float(), logits_scale)
             loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), targets.reshape(-1), ignore_index=-1)
         else:
             loss = None
-            if output_all_seq or return_dict_flag:
-                logits = self.lm_head(x_out) * logits_scale
+            if output_all_seq or return_dict_requested or hf_style_call:
+                logits = apply_float32_multiplier(self.lm_head(x_out).float(), logits_scale)
             else:
-                logits = self.lm_head(x_out[:, [-1], :]).float() * logits_scale
-
-        if not return_logits:
-            logits = None
-        if not return_dict_flag:
-            return logits, loss
+                logits = apply_float32_multiplier(self.lm_head(x_out[:, [-1], :]).float(), logits_scale)
 
         past_out: tuple[PastKeyValue, ...] | None = None
         if use_cache_flag:
             assert present_key_values is not None
             if embed_state_out is not None and present_key_values:
                 past0 = present_key_values[0]
-                present_key_values[0] = (past0[0], past0[1], embed_state_out, past0[-1])
+                present_key_values[0] = (*past0[:-1], embed_state_out, past0[-1])
             past_out = tuple(present_key_values)
+        if not return_logits:
+            logits = None
+        if not return_dict_flag:
+            return causal_lm_output_to_tuple(
+                loss=loss,
+                logits=cast(torch.FloatTensor | None, logits),
+                past_key_values=past_out,
+                hidden_states=hidden_states,
+                attentions=None,
+            )
         return CausalLMOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=past_out,
-            hidden_states=hidden_states,
+            loss=cast(torch.FloatTensor | None, loss),
+            logits=cast(torch.FloatTensor | None, logits),
+            past_key_values=cast(Any, past_out),
+            hidden_states=cast(tuple[torch.FloatTensor, ...] | None, hidden_states),
             attentions=None,
         )
 
@@ -751,29 +509,12 @@ class GPT(PreTrainedModel):
         mfu = flops_achieved / flops_promised
         return mfu
 
-    def get_num_params(self, non_embedding=True):
-        """
-        Return the number of parameters in the model.
-        For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
-        """
-        n_params = sum(p.numel() for p in self.parameters())
-        # if non_embedding:
-        #     n_params -= self.transformer.wpe.weight.numel()
-        # return n_params
-        return n_params
+    def get_num_params(self, non_embedding: bool = True) -> int:
+        return super().get_num_params(non_embedding=non_embedding)
 
-    def save_pretrained(self, save_directory):
-        self.config.save_pretrained(save_directory)
-        super().save_pretrained(save_directory, safe_serialization=False)
+    def save_pretrained(self, save_directory: str, *args: Any, **kwargs: Any) -> None:
+        super().save_pretrained(save_directory, *args, **kwargs)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path: str, *model_args: Any, **kwargs: Any) -> Any:
-        config = kwargs.pop("config", None)
-        if config is None:
-            config = cls.config_class.from_pretrained(pretrained_model_name_or_path, **kwargs)
-        model = super().from_pretrained(pretrained_model_name_or_path, config=config, *model_args, **kwargs)
-        if isinstance(model, GPT):
-            model.tie_weights()
-        return model
+        return super().from_pretrained(pretrained_model_name_or_path, *model_args, **kwargs)
